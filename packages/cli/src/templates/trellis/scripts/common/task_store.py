@@ -20,7 +20,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -59,6 +60,13 @@ from .safe_commit import (
     print_gitignore_warning,
     safe_archive_paths_to_add,
     safe_git_add,
+)
+from .task_rename import cmd_rename as cmd_rename
+from .task_store_helpers import (
+    _find_archived_task_by_dir_name,
+    _repo_relative_path,
+    _report_read_failure,
+    _report_write_failure,
 )
 from .task_utils import (
     archive_destination_for,
@@ -116,50 +124,36 @@ def ensure_tasks_dir(repo_root: Path) -> Path:
     archive_dir = tasks_dir / "archive"
 
     if not tasks_dir.exists():
-        tasks_dir.mkdir(parents=True)
+        tasks_dir.mkdir(parents=True, exist_ok=True)
         print(colored(f"Created tasks directory: {tasks_dir}", Colors.GREEN), file=sys.stderr)
 
-    if not archive_dir.exists():
-        archive_dir.mkdir(parents=True)
+    archive_dir.mkdir(exist_ok=True)
 
     return tasks_dir
 
 
-def _find_archived_task_by_dir_name(tasks_dir: Path, dir_name: str) -> Path | None:
-    """Find an archived task directory with the exact active-task dir name."""
-    archive_dir = tasks_dir / DIR_ARCHIVE
-    if not archive_dir.is_dir():
-        return None
-
-    for month_dir in sorted(archive_dir.iterdir()):
-        if not month_dir.is_dir():
-            continue
-        candidate = month_dir / dir_name
-        if candidate.is_dir():
-            return candidate
-
-    return None
-
-
-def _repo_relative_path(path: Path, repo_root: Path) -> str:
-    """Format a path relative to the repo root when possible."""
-    try:
-        return path.relative_to(repo_root).as_posix()
-    except ValueError:
-        return str(path)
-
-
-def _report_read_failure(path: Path, reason: str | None) -> None:
-    """Print why a JSON file could not be loaded, and what to do about it.
-
-    These commands are about to rewrite the file they just failed to read, so
-    this message is the last warning the user gets. Exiting non-zero with no
-    output at all leaves a parse error, a permissions error and an empty file
-    indistinguishable.
-    """
-    problem, hint = describe_json_read_failure(path, reason)
-    print(colored(f"Error: {problem}", Colors.RED), file=sys.stderr)
-    print(hint, file=sys.stderr)
+@contextmanager
+def _task_relationship_lock(repo_root: Path) -> Iterator[bool]:
+    # Lock a stable inode. task.json is atomically replaced and unlinking the
+    # sidecar would let a new opener bypass waiters on the previous inode.
+    path = repo_root / DIR_WORKFLOW / ".runtime" / "task-relationships.lock"
+    with ExitStack() as stack:
+        try:
+            path.parent.mkdir(exist_ok=True)
+            lock = stack.enter_context(path.open("a+b"))
+            if sys.platform == "win32":
+                import msvcrt
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError as exc:
+            print(colored(f"Error: Cannot lock task relationships at {path}: {exc}", Colors.RED), file=sys.stderr)
+            yield False
+            return
+        # Closing the file releases either OS lock, including on process exit.
+        yield True
 
 
 def _ensure_children_list(data: dict) -> list:
@@ -184,16 +178,6 @@ def _ensure_children_list(data: dict) -> list:
         children = []
         data["children"] = children
     return children
-
-
-def _report_write_failure(path: Path) -> None:
-    """Print that a JSON write failed. Writes are atomic, so nothing changed."""
-    print(colored(f"Error: Failed to write {path}", Colors.RED), file=sys.stderr)
-    print(
-        "The existing file is unchanged (writes are atomic). "
-        "Check permissions and free disk space, then retry.",
-        file=sys.stderr,
-    )
 
 
 def _restore_child_links(unlinked: dict[Path, str | None]) -> None:
@@ -253,6 +237,8 @@ _SUBAGENT_CONFIG_DIRS: tuple[str, ...] = (
     ".pi",        # Pi Agent
     ".trae",      # Trae IDE
     ".omp",       # Oh My Pi
+    ".reasonix",
+    ".snow/skills",
     ".zcode",     # ZCode
     ".grok",      # Grok Build
     ".kimi-code", # Kimi Code
@@ -325,6 +311,37 @@ def _default_prd_content(title: str, description: str | None = None) -> str:
 # =============================================================================
 # Command: create
 # =============================================================================
+
+def _link_created_task(
+    parent_dir: Path, parent_data: dict, task_dir: Path, task_data: dict, repo_root: Path,
+) -> bool:
+    parent_json_path = parent_dir / FILE_TASK_JSON
+    task_json_path = task_dir / FILE_TASK_JSON
+    dir_name = task_dir.name
+    parent_children = _ensure_children_list(parent_data)
+    if dir_name not in parent_children:
+        parent_children.append(dir_name)
+        if not write_json(parent_json_path, parent_data):
+            _report_write_failure(parent_json_path)
+            print(
+                f"The task exists at {_repo_relative_path(task_dir, repo_root)} but is NOT "
+                f"linked to {parent_dir.name}. Re-link with: task.py add-subtask "
+                f"{parent_dir.name} {dir_name}",
+                file=sys.stderr,
+            )
+            return False
+
+    task_data["parent"] = parent_dir.name
+    if not write_json(task_json_path, task_data):
+        _report_write_failure(task_json_path)
+        print(
+            f"Link is half-written: {parent_dir.name} now lists '{dir_name}' as a child, "
+            f"but the new task does not record its parent.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
 
 def cmd_create(args: argparse.Namespace) -> int:
     """Create a new task."""
@@ -442,7 +459,6 @@ def cmd_create(args: argparse.Namespace) -> int:
     # cannot be linked is a failed request, not a warning: creating the task
     # anyway leaves a half-specified relationship that reads as success.
     parent_dir: Path | None = None
-    parent_data: dict | None = None
     if args.parent:
         parent_dir = resolve_task_dir(args.parent, repo_root)
         if parent_dir is None:
@@ -454,47 +470,10 @@ def cmd_create(args: argparse.Namespace) -> int:
             print(colored(f"Error: Parent task.json not found: {args.parent}", Colors.RED), file=sys.stderr)
             print("No task was created. Pass an existing task directory to --parent.", file=sys.stderr)
             return 1
-        parent_data, parent_reason = read_json_checked(parent_json_path)
-        if parent_data is None:
-            _report_read_failure(parent_json_path, parent_reason)
-            print("No task was created. Fix the parent task.json, then retry.", file=sys.stderr)
-            return 1
 
     dir_name = f"{date_prefix}-{slug}"
     task_dir = tasks_dir / dir_name
     task_json_path = task_dir / FILE_TASK_JSON
-
-    archived_task_dir = _find_archived_task_by_dir_name(tasks_dir, dir_name)
-    if archived_task_dir:
-        print(colored(f"Error: Task already archived: {dir_name}", Colors.RED), file=sys.stderr)
-        print(f"Archived at: {_repo_relative_path(archived_task_dir, repo_root)}", file=sys.stderr)
-        print("Use a new slug if you intend to create a new task.", file=sys.stderr)
-        return 1
-
-    # Reusing a slug on the same day is an ordinary accident, and continuing
-    # would rewrite the existing task.json below — resetting status, children,
-    # parent, branch and meta, which nothing else can reconstruct. Fail like
-    # the archived-name collision above unless the caller asks for it.
-    if task_dir.exists():
-        if not getattr(args, "force", False):
-            print(colored(f"Error: Task already exists: {dir_name}", Colors.RED), file=sys.stderr)
-            print(f"Existing task at: {_repo_relative_path(task_dir, repo_root)}", file=sys.stderr)
-            print(
-                "Use a different --slug, or pass --force to overwrite its task.json.",
-                file=sys.stderr,
-            )
-            return 1
-        print(
-            colored(
-                f"Warning: --force: overwriting task.json in existing task: {dir_name}",
-                Colors.YELLOW,
-            ),
-            file=sys.stderr,
-        )
-        created_dir = False
-    else:
-        task_dir.mkdir(parents=True)
-        created_dir = True
 
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -552,75 +531,94 @@ def cmd_create(args: argparse.Namespace) -> int:
         "meta": meta,
     }
 
-    # A directory without task.json is not a task: `list` hides it and every
-    # lifecycle command refuses it. Fail here rather than printing "Created
-    # task" and emitting the path for script chaining.
-    if not write_json(task_json_path, task_data):
-        _report_write_failure(task_json_path)
-        print(colored(f"No task was created: {dir_name}", Colors.RED), file=sys.stderr)
-        if created_dir:
-            try:
-                task_dir.rmdir()
-            except OSError:
+    lock = _task_relationship_lock(repo_root) if parent_dir is not None else nullcontext(True)
+    with lock as acquired:
+        if not acquired:
+            return 1
+        parent_data = None
+        if parent_dir is not None:
+            parent_json_path = parent_dir / FILE_TASK_JSON
+            parent_data, parent_reason = read_json_checked(parent_json_path)
+            if parent_data is None:
+                _report_read_failure(parent_json_path, parent_reason)
+                print("No task was created. Fix the parent task.json, then retry.", file=sys.stderr)
+                return 1
+
+        archived_task_dir = _find_archived_task_by_dir_name(tasks_dir, dir_name)
+        if archived_task_dir:
+            print(colored(f"Error: Task already archived: {dir_name}", Colors.RED), file=sys.stderr)
+            print(f"Archived at: {_repo_relative_path(archived_task_dir, repo_root)}", file=sys.stderr)
+            print("Use a new slug if you intend to create a new task.", file=sys.stderr)
+            return 1
+
+        # Reusing a slug on the same day is an ordinary accident, and continuing
+        # would rewrite the existing task.json below — resetting status, children,
+        # parent, branch and meta, which nothing else can reconstruct. Fail like
+        # the archived-name collision above unless the caller asks for it.
+        if task_dir.exists():
+            if not getattr(args, "force", False):
+                print(colored(f"Error: Task already exists: {dir_name}", Colors.RED), file=sys.stderr)
+                print(f"Existing task at: {_repo_relative_path(task_dir, repo_root)}", file=sys.stderr)
                 print(
-                    f"Leftover empty directory: {_repo_relative_path(task_dir, repo_root)}",
-                    file=sys.stderr,
-                )
-        return 1
-
-    prd_path = task_dir / "prd.md"
-    if not prd_path.exists():
-        prd_path.write_text(
-            _default_prd_content(args.title, description),
-            encoding="utf-8",
-        )
-
-    # Create empty implement.jsonl / check.jsonl for sub-agent-capable
-    # platforms. They stay empty until the agent curates real entries during
-    # planning — a placeholder row would read as unresolved scaffolding to
-    # `task.py validate` and to PR preflight, so the curation instructions go
-    # to the console below instead of into the files. Agent-less platforms
-    # (Kilo / Antigravity / Devin) skip this — they load specs via the
-    # trellis-before-dev skill instead of JSONL.
-    created_jsonl = False
-    if _has_subagent_platform(repo_root):
-        for jsonl_name in ("implement.jsonl", "check.jsonl"):
-            jsonl_path = task_dir / jsonl_name
-            if not jsonl_path.exists():
-                jsonl_path.write_text("", encoding="utf-8")
-        created_jsonl = True
-
-    # Establish the bidirectional link. Both sides were validated above, so a
-    # failure here is a write failure, not a bad argument.
-    if parent_dir is not None and parent_data is not None:
-        parent_json_path = parent_dir / FILE_TASK_JSON
-
-        # Add child to parent's children list
-        parent_children = _ensure_children_list(parent_data)
-        if dir_name not in parent_children:
-            parent_children.append(dir_name)
-            parent_data["children"] = parent_children
-            if not write_json(parent_json_path, parent_data):
-                _report_write_failure(parent_json_path)
-                print(
-                    f"The task exists at {_repo_relative_path(task_dir, repo_root)} but is NOT "
-                    f"linked to {parent_dir.name}. Re-link with: task.py add-subtask "
-                    f"{parent_dir.name} {dir_name}",
+                    "Use a different --slug, or pass --force to overwrite its task.json.",
                     file=sys.stderr,
                 )
                 return 1
-
-        # Set parent in child's task.json
-        task_data["parent"] = parent_dir.name
-        if not write_json(task_json_path, task_data):
-            _report_write_failure(task_json_path)
             print(
-                f"Link is half-written: {parent_dir.name} now lists '{dir_name}' as a child, "
-                f"but the new task does not record its parent.",
+                colored(
+                    f"Warning: --force: overwriting task.json in existing task: {dir_name}",
+                    Colors.YELLOW,
+                ),
                 file=sys.stderr,
             )
+            created_dir = False
+        else:
+            task_dir.mkdir(parents=True)
+            created_dir = True
+
+        # A directory without task.json is not a task: `list` hides it and every
+        # lifecycle command refuses it. Fail here rather than printing "Created
+        # task" and emitting the path for script chaining.
+        if not write_json(task_json_path, task_data):
+            _report_write_failure(task_json_path)
+            print(colored(f"No task was created: {dir_name}", Colors.RED), file=sys.stderr)
+            if created_dir:
+                try:
+                    task_dir.rmdir()
+                except OSError:
+                    print(
+                        f"Leftover empty directory: {_repo_relative_path(task_dir, repo_root)}",
+                        file=sys.stderr,
+                    )
             return 1
 
+        prd_path = task_dir / "prd.md"
+        if not prd_path.exists():
+            prd_path.write_text(
+                _default_prd_content(args.title, description),
+                encoding="utf-8",
+            )
+
+        # Create empty implement.jsonl / check.jsonl for sub-agent-capable
+        # platforms. They stay empty until the agent curates real entries during
+        # planning — a placeholder row would read as unresolved scaffolding to
+        # `task.py validate` and to PR preflight, so the curation instructions go
+        # to the console below instead of into the files. Agent-less platforms
+        # (Kilo / Antigravity / Devin) skip this — they load specs via the
+        # trellis-before-dev skill instead of JSONL.
+        created_jsonl = False
+        if _has_subagent_platform(repo_root):
+            for jsonl_name in ("implement.jsonl", "check.jsonl"):
+                jsonl_path = task_dir / jsonl_name
+                if not jsonl_path.exists():
+                    jsonl_path.write_text("", encoding="utf-8")
+            created_jsonl = True
+
+        if parent_dir is not None and parent_data is not None:
+            if not _link_created_task(parent_dir, parent_data, task_dir, task_data, repo_root):
+                return 1
+
+    if parent_dir is not None:
         print(colored(f"Linked as child of: {parent_dir.name}", Colors.GREEN), file=sys.stderr)
 
     # Auto-activate the new task so the per-turn breadcrumb fires planning
@@ -708,459 +706,6 @@ def cmd_create(args: argparse.Namespace) -> int:
     print(f"{DIR_WORKFLOW}/{DIR_TASKS}/{dir_name}")
 
     run_task_hooks("after_create", task_json_path, repo_root)
-    return 0
-
-
-# =============================================================================
-# Command: rename
-# =============================================================================
-
-# task.json fields that carry the task's own slug. The directory name carries
-# it too, prefixed with the creation date; everything else that names the task
-# (parent / children / subtasks in *other* tasks, jsonl paths) stores the full
-# directory name instead.
-RENAME_IDENTITY_FIELDS: tuple[str, ...] = ("id", "name")
-
-_JSONL_NAMES: tuple[str, ...] = ("implement.jsonl", "check.jsonl")
-
-
-@dataclass
-class _RenamePlan:
-    """Every change a rename would make, computed before anything is written.
-
-    ``--dry-run`` and the real run render their output from this one structure,
-    so the printed change set cannot drift from the applied one.
-    """
-
-    task_dir: Path
-    new_dir: Path
-    old_name: str
-    new_name: str
-    old_rel: str
-    new_rel: str
-    task_json_path: Path
-    task_data: dict
-    # (field, current value, new value) for each identity field that changes.
-    identity: list[tuple[str, object, str]] = field(default_factory=list)
-    # (jsonl path, changed line numbers, full new file text)
-    jsonl: list[tuple[Path, list[int], str]] = field(default_factory=list)
-    # (other task's task.json, rewritten data, labels of the changed refs)
-    backrefs: list[tuple[Path, dict, list[str]]] = field(default_factory=list)
-    # (file, line number) of old-name mentions elsewhere under .trellis/
-    reported: list[tuple[Path, int]] = field(default_factory=list)
-    # Task dirs whose task.json could not be read, so back-refs in them are
-    # neither rewritten nor ruled out.
-    unreadable: list[Path] = field(default_factory=list)
-
-
-def _split_date_prefix(dir_name: str) -> tuple[str, str]:
-    """Split ``MM-DD-slug`` into ``("MM-DD", "slug")``.
-
-    Returns ``("", dir_name)`` when there is no plausible date prefix, so a
-    hand-made directory name without one is renamed to the bare slug.
-    """
-    m = re.match(r"^(\d{2})-(\d{2})-(.+)$", dir_name)
-    if m and 1 <= int(m.group(1)) <= 12 and 1 <= int(m.group(2)) <= 31:
-        return f"{m.group(1)}-{m.group(2)}", m.group(3)
-    return "", dir_name
-
-
-def _validate_rename_slug(slug: str, date_prefix: str) -> str | None:
-    """Return the slug body to rename to, or None after reporting the refusal.
-
-    Mirrors ``create``'s ``--slug`` handling: no path separators or ``..`` (the
-    slug is joined into a directory name), and a pasted-in date prefix is
-    normalized away rather than doubled — but a rename keeps the task's
-    *original* creation date, not today's.
-    """
-    if not slug:
-        print(colored("Error: new slug is required", Colors.RED), file=sys.stderr)
-        return None
-
-    if "/" in slug or "\\" in slug or ".." in slug:
-        print(
-            colored(
-                f"Error: <new-slug> must be a plain name without path separators or '..': {slug}",
-                Colors.RED,
-            ),
-            file=sys.stderr,
-        )
-        return None
-
-    slug_prefix, body = _split_date_prefix(slug)
-    if not slug_prefix:
-        return slug
-    if slug_prefix == date_prefix:
-        print(
-            colored(
-                f'warning: <new-slug> should not include the MM-DD prefix; normalized to "{body}"',
-                Colors.YELLOW,
-            ),
-            file=sys.stderr,
-        )
-        return body
-    print(
-        colored(
-            f"Error: <new-slug> starts with a date prefix ({slug_prefix}-), but rename keeps "
-            f"the task's own creation date ({date_prefix}).",
-            Colors.RED,
-        ),
-        file=sys.stderr,
-    )
-    print(f"Pass only the slug body, e.g. {body}", file=sys.stderr)
-    return None
-
-
-def _plan_jsonl_rewrites(
-    task_dir: Path, old_rel: str, new_rel: str
-) -> list[tuple[Path, list[int], str]]:
-    """Plan rewrites of context entries pointing under the old task directory.
-
-    Matching on ``<old path>/`` rather than the bare path keeps a sibling task
-    whose name merely starts with this one's out of the rewrite.
-    """
-    rewrites: list[tuple[Path, list[int], str]] = []
-    needle = f"{old_rel}/"
-    replacement = f"{new_rel}/"
-
-    for jsonl_name in _JSONL_NAMES:
-        jsonl_path = task_dir / jsonl_name
-        if not jsonl_path.is_file():
-            continue
-        try:
-            lines = jsonl_path.read_text(encoding="utf-8").splitlines(keepends=True)
-        except (OSError, UnicodeDecodeError):
-            continue
-
-        changed: list[int] = []
-        for index, line in enumerate(lines):
-            if needle in line:
-                lines[index] = line.replace(needle, replacement)
-                changed.append(index + 1)
-        if changed:
-            rewrites.append((jsonl_path, changed, "".join(lines)))
-
-    return rewrites
-
-
-def _plan_backrefs(
-    tasks_dir: Path, task_dir: Path, old_name: str, new_name: str
-) -> tuple[list[tuple[Path, dict, list[str]]], list[Path]]:
-    """Plan back-reference rewrites in the other active tasks.
-
-    Returns ``(changes, unreadable)``. ``subtasks`` is the legacy spelling of
-    ``children`` and is still carried in older task.json files, so both lists
-    are rewritten.
-    """
-    changes: list[tuple[Path, dict, list[str]]] = []
-    unreadable: list[Path] = []
-
-    for candidate in sorted(tasks_dir.iterdir()):
-        if not candidate.is_dir() or candidate.name == DIR_ARCHIVE:
-            continue
-        if candidate == task_dir:
-            continue
-        json_path = candidate / FILE_TASK_JSON
-        if not json_path.is_file():
-            continue
-
-        data, _reason = read_json_checked(json_path)
-        if data is None:
-            unreadable.append(json_path)
-            continue
-
-        labels: list[str] = []
-        if data.get("parent") == old_name:
-            data["parent"] = new_name
-            labels.append("parent")
-        for list_field in ("children", "subtasks"):
-            values = data.get(list_field)
-            if not isinstance(values, list):
-                continue
-            for index, value in enumerate(values):
-                if value == old_name:
-                    values[index] = new_name
-                    labels.append(f"{list_field}[{index}]")
-
-        if labels:
-            changes.append((json_path, data, labels))
-
-    return changes, unreadable
-
-
-def _plan_reported_refs(
-    repo_root: Path, task_dir: Path, rewritten: set[Path], old_name: str
-) -> list[tuple[Path, int]]:
-    """Find remaining mentions of the old task name elsewhere under .trellis/.
-
-    These are reported, never rewritten: journal entries and workflow prose
-    cite tasks in free text, and a blind substitution there is how a rename
-    turns into a diff nobody asked for. The boundary-anchored pattern keeps a
-    longer task name that merely contains this one out.
-
-    Runtime session pointers are excluded because they are not prose and they
-    *are* rewritten — see ``repoint_task_in_sessions``. Listing them here as
-    "not rewritten" would be a false statement about the one file whose
-    staleness actually breaks the next command.
-    """
-    from .active_task import _runtime_sessions_dir
-
-    pattern = re.compile(
-        r"(?<![0-9A-Za-z_-])" + re.escape(old_name) + r"(?![0-9A-Za-z_-])"
-    )
-    hits: list[tuple[Path, int]] = []
-    trellis_dir = repo_root / DIR_WORKFLOW
-    sessions_dir = _runtime_sessions_dir(repo_root)
-    if not trellis_dir.is_dir():
-        return hits
-
-    for path in sorted(trellis_dir.rglob("*")):
-        if not path.is_file() or path in rewritten:
-            continue
-        if path == task_dir or task_dir in path.parents:
-            continue
-        if path.parent == sessions_dir:
-            continue
-        if any(
-            part == "__pycache__" or part.startswith(".backup-")
-            for part in path.relative_to(trellis_dir).parts[:-1]
-        ):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if pattern.search(line):
-                hits.append((path, lineno))
-
-    return hits
-
-
-def _render_rename_plan(plan: _RenamePlan, repo_root: Path) -> list[str]:
-    """Render the change set. Identical for --dry-run and the real run."""
-    lines = [
-        f"rename: {plan.old_name} -> {plan.new_name}",
-        f"  dir: {plan.old_rel} -> {plan.new_rel}",
-    ]
-    for field_name, old_value, new_value in plan.identity:
-        lines.append(f"  task.json: {field_name}: {old_value} -> {new_value}")
-    for json_path, _data, labels in plan.backrefs:
-        rel = _repo_relative_path(json_path, repo_root)
-        for label in labels:
-            lines.append(
-                f"  backref: {rel}: {label}: {plan.old_name} -> {plan.new_name}"
-            )
-    for jsonl_path, linenos, _text in plan.jsonl:
-        rel = _repo_relative_path(jsonl_path, repo_root)
-        for lineno in linenos:
-            lines.append(
-                f"  jsonl: {rel}:{lineno}: {plan.old_rel}/ -> {plan.new_rel}/"
-            )
-    for path, lineno in plan.reported:
-        lines.append(
-            f"  reported (not rewritten): {_repo_relative_path(path, repo_root)}:{lineno}"
-        )
-    lines.append(
-        f"  sessions: any active-task pointer at {plan.old_rel} is repointed to {plan.new_rel}"
-    )
-    return lines
-
-
-def _rename_interrupted(plan: _RenamePlan) -> None:
-    """Explain how to finish a rename that stopped part-way through."""
-    print(
-        f"The task is still at {plan.old_rel} and was NOT moved. Every step up to "
-        f"this one is idempotent: fix the write failure, then run the same rename "
-        f"again to finish it.",
-        file=sys.stderr,
-    )
-
-
-def _apply_rename(plan: _RenamePlan, repo_root: Path) -> int:
-    """Write the planned change set.
-
-    The directory move goes last on purpose. Everything before it is an
-    in-place edit that re-running the identical command recomputes as
-    already-done, so an interruption leaves a tree that the same command
-    finishes; a move-first ordering would instead leave the old name
-    unresolvable and the remaining edits to be made by hand.
-    """
-    if plan.identity:
-        data = dict(plan.task_data)
-        for field_name, _old_value, new_value in plan.identity:
-            data[field_name] = new_value
-        if not write_json(plan.task_json_path, data):
-            _report_write_failure(plan.task_json_path)
-            print("Nothing was renamed.", file=sys.stderr)
-            return 1
-
-    for jsonl_path, _linenos, text in plan.jsonl:
-        try:
-            jsonl_path.write_text(text, encoding="utf-8")
-        except OSError as exc:
-            print(
-                colored(f"Error: Failed to write {jsonl_path}: {exc}", Colors.RED),
-                file=sys.stderr,
-            )
-            _rename_interrupted(plan)
-            return 1
-
-    for json_path, data, _labels in plan.backrefs:
-        if not write_json(json_path, data):
-            _report_write_failure(json_path)
-            _rename_interrupted(plan)
-            return 1
-
-    try:
-        plan.task_dir.rename(plan.new_dir)
-    except OSError as exc:
-        print(
-            colored(f"Error: Failed to move {plan.old_rel} -> {plan.new_rel}: {exc}", Colors.RED),
-            file=sys.stderr,
-        )
-        _rename_interrupted(plan)
-        return 1
-
-    # Last, and after the move: a session pointing at the old path would now
-    # resolve to a missing directory, so `current` would report the task stale
-    # and the context hook would inject nothing until the user ran `start`
-    # again. Archive clears these pointers because the task is leaving; rename
-    # moves them, because the task is still the one being worked on.
-    from .active_task import repoint_task_in_sessions
-
-    repoint_task_in_sessions(str(plan.task_dir), str(plan.new_dir), repo_root)
-
-    return 0
-
-
-def cmd_rename(args: argparse.Namespace) -> int:
-    """Rename a task and every reference to it."""
-    repo_root = get_repo_root()
-    tasks_dir = get_tasks_dir(repo_root)
-
-    task_dir = resolve_task_dir(args.name, repo_root)
-    if task_dir is None or not task_dir.is_dir():
-        if task_dir is not None:
-            print(colored(f"Error: Task not found: {args.name}", Colors.RED), file=sys.stderr)
-        return 1
-
-    # Narrower than resolve_task_dir's containment: an archived task has left
-    # the active set, so its back-references are no longer maintained here.
-    if not is_within_tasks_dir(task_dir, repo_root):
-        print(
-            colored(
-                f"Error: refusing to rename '{args.name}': "
-                f"{task_dir} is not an active task under {tasks_dir}",
-                Colors.RED,
-            ),
-            file=sys.stderr,
-        )
-        return 1
-
-    old_name = task_dir.name
-    date_prefix, _old_slug = _split_date_prefix(old_name)
-
-    slug = _validate_rename_slug(args.new_slug, date_prefix)
-    if slug is None:
-        return 1
-
-    new_name = f"{date_prefix}-{slug}" if date_prefix else slug
-    if new_name == old_name:
-        print(
-            colored(f"Error: '{new_name}' is the task's current name", Colors.RED),
-            file=sys.stderr,
-        )
-        return 1
-
-    new_dir = task_dir.parent / new_name
-    if new_dir.exists():
-        print(
-            colored(f"Error: Task already exists: {new_name}", Colors.RED),
-            file=sys.stderr,
-        )
-        print(f"Existing task at: {_repo_relative_path(new_dir, repo_root)}", file=sys.stderr)
-        print("Pick a different slug.", file=sys.stderr)
-        return 1
-
-    archived_task_dir = _find_archived_task_by_dir_name(tasks_dir, new_name)
-    if archived_task_dir:
-        print(
-            colored(f"Error: Task already archived: {new_name}", Colors.RED),
-            file=sys.stderr,
-        )
-        print(f"Archived at: {_repo_relative_path(archived_task_dir, repo_root)}", file=sys.stderr)
-        print("Pick a different slug.", file=sys.stderr)
-        return 1
-
-    task_json_path = task_dir / FILE_TASK_JSON
-    if not task_json_path.is_file():
-        print(
-            colored(f"Error: task.json not found at {task_dir}", Colors.RED),
-            file=sys.stderr,
-        )
-        return 1
-
-    task_data, reason = read_json_checked(task_json_path)
-    if task_data is None:
-        _report_read_failure(task_json_path, reason)
-        print("Nothing was renamed.", file=sys.stderr)
-        return 1
-
-    plan = _RenamePlan(
-        task_dir=task_dir,
-        new_dir=new_dir,
-        old_name=old_name,
-        new_name=new_name,
-        old_rel=_repo_relative_path(task_dir, repo_root),
-        new_rel=_repo_relative_path(new_dir, repo_root),
-        task_json_path=task_json_path,
-        task_data=task_data,
-    )
-    plan.identity = [
-        (name, task_data.get(name), slug)
-        for name in RENAME_IDENTITY_FIELDS
-        if task_data.get(name) != slug
-    ]
-    plan.jsonl = _plan_jsonl_rewrites(task_dir, plan.old_rel, plan.new_rel)
-    plan.backrefs, plan.unreadable = _plan_backrefs(
-        tasks_dir, task_dir, old_name, new_name
-    )
-    rewritten = {path for path, _linenos, _text in plan.jsonl}
-    rewritten.update(path for path, _data, _labels in plan.backrefs)
-    plan.reported = _plan_reported_refs(repo_root, task_dir, rewritten, old_name)
-
-    for line in _render_rename_plan(plan, repo_root):
-        print(line)
-
-    for json_path in plan.unreadable:
-        print(
-            colored(
-                f"Warning: {_repo_relative_path(json_path, repo_root)} could not be read; "
-                "any back-reference in it is left as-is.",
-                Colors.YELLOW,
-            ),
-            file=sys.stderr,
-        )
-
-    if getattr(args, "dry_run", False):
-        print(colored("Dry run: nothing was written.", Colors.YELLOW), file=sys.stderr)
-        return 0
-
-    rc = _apply_rename(plan, repo_root)
-    if rc != 0:
-        return rc
-
-    print(colored(f"Renamed: {old_name} -> {new_name}", Colors.GREEN), file=sys.stderr)
-    if plan.reported:
-        print(
-            colored(
-                f"{len(plan.reported)} reference(s) elsewhere under {DIR_WORKFLOW}/ "
-                "still name the old task; they are listed above and were not rewritten.",
-                Colors.YELLOW,
-            ),
-            file=sys.stderr,
-        )
     return 0
 
 
@@ -1613,88 +1158,20 @@ def _print_index_lock_warning(
 
 
 # =============================================================================
-# Command: add-subtask
+# Commands: add-subtask / remove-subtask
 # =============================================================================
 
 def cmd_add_subtask(args: argparse.Namespace) -> int:
     """Link a child task to a parent task."""
-    repo_root = get_repo_root()
+    return _update_subtask(args, unlink=False)
 
-    parent_dir = resolve_task_dir(args.parent_dir, repo_root)
-    child_dir = resolve_task_dir(args.child_dir, repo_root)
-    if parent_dir is None or child_dir is None:
-        return 1
-
-    if not parent_dir:
-        print(colored(f"Error: Parent task.json not found: {args.parent_dir}", Colors.RED), file=sys.stderr)
-        return 1
-
-    if not child_dir:
-        print(colored(f"Error: Child task.json not found: {args.child_dir}", Colors.RED), file=sys.stderr)
-        return 1
-
-    parent_json_path = parent_dir / FILE_TASK_JSON
-    child_json_path = child_dir / FILE_TASK_JSON
-
-    if not parent_json_path.is_file():
-        print(colored(f"Error: Parent task.json not found: {args.parent_dir}", Colors.RED), file=sys.stderr)
-        return 1
-
-    if not child_json_path.is_file():
-        print(colored(f"Error: Child task.json not found: {args.child_dir}", Colors.RED), file=sys.stderr)
-        return 1
-
-    parent_data, parent_reason = read_json_checked(parent_json_path)
-    if parent_data is None:
-        _report_read_failure(parent_json_path, parent_reason)
-        return 1
-    child_data, child_reason = read_json_checked(child_json_path)
-    if child_data is None:
-        _report_read_failure(child_json_path, child_reason)
-        return 1
-
-    # Check if child already has a parent
-    existing_parent = child_data.get("parent")
-    if existing_parent:
-        print(colored(f"Error: Child task already has a parent: {existing_parent}", Colors.RED), file=sys.stderr)
-        return 1
-
-    # Add child to parent's children list
-    parent_children = _ensure_children_list(parent_data)
-    child_dir_name = child_dir.name
-    if child_dir_name not in parent_children:
-        parent_children.append(child_dir_name)
-        parent_data["children"] = parent_children
-
-    # Set parent in child's task.json
-    child_data["parent"] = parent_dir.name
-
-    # Write both. A link is two files; if the second write fails silently the
-    # two sides disagree with no error, so check each and name the side that
-    # did land so the user knows what to undo.
-    if not write_json(parent_json_path, parent_data):
-        print(colored(f"Error: Failed to write parent task.json: {parent_json_path}", Colors.RED), file=sys.stderr)
-        print("No link was written.", file=sys.stderr)
-        return 1
-    if not write_json(child_json_path, child_data):
-        print(colored(f"Error: Failed to write child task.json: {child_json_path}", Colors.RED), file=sys.stderr)
-        print(
-            f"Link is half-written: {parent_json_path} now lists "
-            f"'{child_dir.name}' as a child, but the child does not record the parent.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(colored(f"Linked: {child_dir.name} -> {parent_dir.name}", Colors.GREEN), file=sys.stderr)
-    return 0
-
-
-# =============================================================================
-# Command: remove-subtask
-# =============================================================================
 
 def cmd_remove_subtask(args: argparse.Namespace) -> int:
     """Unlink a child task from a parent task."""
+    return _update_subtask(args, unlink=True)
+
+
+def _update_subtask(args: argparse.Namespace, *, unlink: bool) -> int:
     repo_root = get_repo_root()
 
     parent_dir = resolve_task_dir(args.parent_dir, repo_root)
@@ -1721,41 +1198,55 @@ def cmd_remove_subtask(args: argparse.Namespace) -> int:
         print(colored(f"Error: Child task.json not found: {args.child_dir}", Colors.RED), file=sys.stderr)
         return 1
 
-    parent_data, parent_reason = read_json_checked(parent_json_path)
-    if parent_data is None:
-        _report_read_failure(parent_json_path, parent_reason)
-        return 1
-    child_data, child_reason = read_json_checked(child_json_path)
-    if child_data is None:
-        _report_read_failure(child_json_path, child_reason)
-        return 1
+    with _task_relationship_lock(repo_root) as acquired:
+        if not acquired:
+            return 1
+        parent_data, parent_reason = read_json_checked(parent_json_path)
+        if parent_data is None:
+            _report_read_failure(parent_json_path, parent_reason)
+            return 1
+        child_data, child_reason = read_json_checked(child_json_path)
+        if child_data is None:
+            _report_read_failure(child_json_path, child_reason)
+            return 1
 
-    # Remove child from parent's children list
-    parent_children = _ensure_children_list(parent_data)
-    child_dir_name = child_dir.name
-    if child_dir_name in parent_children:
-        parent_children.remove(child_dir_name)
-        parent_data["children"] = parent_children
+        existing_parent = child_data.get("parent")
+        children = _ensure_children_list(parent_data)
+        if existing_parent and (not unlink or existing_parent != parent_dir.name):
+            print(colored(f"Error: Child task already has a parent: {existing_parent}", Colors.RED), file=sys.stderr)
+            return 1
+        if unlink:
+            if child_dir.name in children:
+                children.remove(child_dir.name)
+            child_data["parent"] = None
+        else:
+            if child_dir.name not in children:
+                children.append(child_dir.name)
+            child_data["parent"] = parent_dir.name
 
-    # Clear parent in child's task.json
-    child_data["parent"] = None
+        if not write_json(parent_json_path, parent_data):
+            print(colored(f"Error: Failed to write parent task.json: {parent_json_path}", Colors.RED), file=sys.stderr)
+            print("Nothing was unlinked." if unlink else "No link was written.", file=sys.stderr)
+            return 1
+        if not write_json(child_json_path, child_data):
+            print(colored(f"Error: Failed to write child task.json: {child_json_path}", Colors.RED), file=sys.stderr)
+            if unlink:
+                print(
+                    f"Unlink is half-written: {parent_json_path} no longer lists "
+                    f"'{child_dir.name}', but the child still records the parent.", file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Link is half-written: {parent_json_path} now lists "
+                    f"'{child_dir.name}' as a child, but the child does not record the parent.", file=sys.stderr,
+                )
+            return 1
 
-    # Write both — see cmd_add_subtask: an unchecked second write leaves the
-    # two sides disagreeing with no error.
-    if not write_json(parent_json_path, parent_data):
-        print(colored(f"Error: Failed to write parent task.json: {parent_json_path}", Colors.RED), file=sys.stderr)
-        print("Nothing was unlinked.", file=sys.stderr)
-        return 1
-    if not write_json(child_json_path, child_data):
-        print(colored(f"Error: Failed to write child task.json: {child_json_path}", Colors.RED), file=sys.stderr)
-        print(
-            f"Unlink is half-written: {parent_json_path} no longer lists "
-            f"'{child_dir.name}', but the child still records the parent.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(colored(f"Unlinked: {child_dir.name} from {parent_dir.name}", Colors.GREEN), file=sys.stderr)
+    if unlink:
+        message = f"Unlinked: {child_dir.name} from {parent_dir.name}"
+    else:
+        message = f"Linked: {child_dir.name} -> {parent_dir.name}"
+    print(colored(message, Colors.GREEN), file=sys.stderr)
     return 0
 
 

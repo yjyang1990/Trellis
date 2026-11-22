@@ -70,13 +70,37 @@ describe("collectReasonixTemplates", () => {
     expect(implementPaths).toHaveLength(1);
   });
 
-  it("subagent SKILL.md content carries runAs: subagent frontmatter", () => {
+  it.each(getAllAgents())(
+    "renders context instructions after $name frontmatter",
+    ({ name, content }) => {
+      const role = name.slice("trellis-".length);
+      const skill =
+        collectReasonixTemplates().get(`.reasonix/skills/${name}/SKILL.md`) ?? "";
+      const [frontmatter, body] = skill.split(/^---$/m).slice(1, 3);
+      expect(skill.startsWith("---\n")).toBe(true);
+      expect(frontmatter).toBe(content.split(/^---$/m)[1]);
+      expect(frontmatter).toMatch(/^runAs:\s*subagent\s*$/m);
+      expect(body).toContain("Active task: <path>");
+      expect(body).toContain("task.py current --source");
+      expect(body).toContain(`<task-path>/${role}.jsonl`);
+      for (const artifact of ["prd.md", "design.md", "implement.md"]) {
+        expect(body).toContain(artifact);
+      }
+    },
+  );
+
+  it("keeps ordinary skills free of the subagent prelude", () => {
     const files = collectReasonixTemplates();
-    const checkBody = files.get(".reasonix/skills/trellis-check/SKILL.md");
-    const implementBody = files.get(
-      ".reasonix/skills/trellis-implement/SKILL.md",
-    );
-    expect(checkBody).toMatch(/^runAs:\s*subagent\s*$/m);
-    expect(implementBody).toMatch(/^runAs:\s*subagent\s*$/m);
+    expect(files.has(".reasonix/skills/trellis-start/SKILL.md")).toBe(true);
+    for (const [file, content] of files) {
+      if (
+        !file.endsWith("/SKILL.md") ||
+        EXPECTED_AGENT_NAMES.includes(path.basename(path.dirname(file)))
+      )
+        continue;
+      expect(content, file).not.toContain(
+        "## Required: Load Trellis Context First",
+      );
+    }
   });
 });

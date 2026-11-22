@@ -57,9 +57,20 @@ fs.writeFileSync(hashesPath, JSON.stringify(payload, null, 2));
 writeFileAtomic(hashesPath, JSON.stringify(payload, null, 2));
 ```
 
-> **Note**: atomic write fixes the *crash window*. It does **not** fix
-> concurrent last-writer-wins (multiple processes RMW the same file). File
-> locking / seq reconciliation is a separate, still-open concern.
+### Concurrent task relationships
+
+Within a checkout, `task.py create --parent`, `add-subtask`, and `remove-subtask`
+acquire the same OS advisory lock before reading relationship metadata for an
+update. They hold it through the parent and child `task.json` writes. Competing
+parents therefore also serialize when claiming the same child. The stable
+`.trellis/.runtime/task-relationships.lock` stays in place across calls. Closing
+the descriptor or exiting the process releases the lock. A lock acquisition
+failure exits the command with an error before it creates or links a child.
+
+Readers, standalone creation, Git branch discovery, session activation and
+external hooks run outside this lock. Each JSON replacement is atomic. A failure
+between the two writes can leave a partial link, which the command reports.
+Archive, rename and other metadata writers have separate concurrency semantics.
 
 ---
 
@@ -72,9 +83,9 @@ delete escapes the store.
 
 | Concern | Guard | Location |
 |---|---|---|
-| channel / worker name | `assertSafeName(name, kind)` — `^[A-Za-z0-9._-]+$`, rejects `.`/`..` — called inside `channelDir` (the single chokepoint every path helper passes through) | `core` + `cli` `channel/store/paths.ts` |
+| channel / worker name | `assertSafeName(name, kind)` — `^[A-Za-z0-9._-]+$`, rejects `.`/`..` — called inside `channelDir` (the single chokepoint every path helper passes through) | `packages/core/src/channel/internal/store/paths.ts`, re-exported by the CLI |
 | `task.py archive <name>` target | `is_within_tasks_dir(task_dir_abs, repo_root)` — dir must be a direct child of `.trellis/tasks/` | `scripts/common/task_utils.py` |
-| rename-dir migration source | `dirHasManifestEntries(fromDir, hashes)` — only auto-move a dir Trellis provably created | `commands/update.ts` |
+| rename-dir migration source | `dirHasManifestEntries` checks for an existing tracked source file at a known installation path | `commands/update.ts` |
 
 > **Why the chokepoint, not the entrypoint**: validating inside `channelDir`
 > (not in each of create/rm/run) means one guard covers every current and future
@@ -100,7 +111,7 @@ one of these must hold. Pick by operation:
 | Operation | Required guard |
 |---|---|
 | Delete a mixed-ownership file (e.g. `AGENTS.md`) | Strip only the managed block (`scrubManagedMarkdownBlock`); delete only if nothing user-authored remains. Never `unlinkSync` the whole file. |
-| Move a dir that may be user-owned (rename-dir) | Ownership check (`dirHasManifestEntries`); unowned + target-absent → **skip** (safe even under `--force`, since skip never executes). |
+| Move a dir that may be user-owned (rename-dir) | Require an existing installed source file. An absent target allows a whole-directory move. With both directories present, keep the target and retire only a wholly unmodified source with verified counterparts. Check backup-excluded entries and links as well. |
 | Overwrite a dir from a remote source | Download to a temp dir; `rm` + copy the old dir **only after** the download succeeds (`downloadWithStrategy` `overwrite`). Never delete-then-download. |
 | Rename onto a possibly-existing target | `fs.existsSync(newPath)` first; skip/renumber instead of clobbering (`renameTracesToJournal`). Especially when the dir is excluded from backup. |
 | `rm -rf` a tree with user data (`uninstall`) | `collectUncommittedTrellisData(cwd)` (git status over `spec/tasks/workspace`); scripted `--yes` fails closed unless `TRELLIS_ALLOW_DIRTY_UNINSTALL=1`. Disclosure must name what user data is deleted. |

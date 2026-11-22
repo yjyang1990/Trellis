@@ -615,6 +615,8 @@ async function runGit(args: string[]): Promise<GitCommandOutput> {
       {
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,
+        // classifyGitError matches Git's untranslated diagnostics.
+        env: { ...process.env, LC_ALL: "C" },
         timeout: TIMEOUTS.DOWNLOAD_MS,
       },
       (error, stdout, stderr) => {

@@ -13,7 +13,7 @@ on:
       - '**/*.py'
       - '.github/workflows/ci.yml'
   pull_request:
-    branches: [main]
+    branches: [main, beta, 'feat/v*-beta']
     paths:
       - 'packages/cli/**'
       - 'packages/core/**'
@@ -73,6 +73,9 @@ jobs:
       - name: Test (core + cli)
         run: pnpm test
 
+      - name: Test historical upgrades with packed CLI and core
+        run: pnpm test:upgrade
+
       - name: Verify build output
         run: |
           set -euo pipefail
@@ -83,3 +86,45 @@ jobs:
           test -d packages/cli/dist
           test -f packages/cli/dist/index.js
           echo "Build verification passed"
+
+      - name: Setup minimum supported Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18.17.0'
+
+      - name: Exercise built core and CLI on Node 18.17.0
+        working-directory: packages/cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = 'v18.17.0'
+          node --input-type=module -e 'import "@mindfoldhq/trellis-core"'
+          cli="$PWD/bin/trellis.js"
+          project=$(mktemp -d)
+          git -C "$project" init -q
+          cd "$project"
+          node "$cli" init --claude --yes -u smoke
+          test -s .trellis/.version
+          node "$cli" update --dry-run | tee update.log
+          grep -F 'Already up to date!' update.log
+
+  native-task-relationships:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+      - run: pnpm install --frozen-lockfile
+      - name: Test Python task creation, relationships, and locking
+        run: pnpm --filter @mindfoldhq/trellis exec vitest run test/scripts/task-relationships.integration.test.ts --testTimeout 60000

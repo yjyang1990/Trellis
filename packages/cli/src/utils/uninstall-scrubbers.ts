@@ -7,12 +7,14 @@
  * - `fullyEmpty` is true when, after stripping every trellis-managed value,
  *   nothing meaningful is left. The caller deletes the file in that case.
  *
- * Manifest path matching (for hooks.json scrubbers) uses substring containment
- * on the resolved `command` string. The leading `python3 ` / `python ` prefix
- * does not matter — we just look for the manifest-relative file path.
+ * Hook ownership requires a script path in the removal manifest. Each
+ * platform schema determines how to recognize a registration for that path.
  */
 
+import { isDeepStrictEqual } from "node:util";
 import { getConfigTemplate as getCodexConfigTemplate } from "../templates/codex/index.js";
+
+import { computeHash } from "./template-hash.js";
 
 export interface ScrubResult {
   content: string;
@@ -199,6 +201,138 @@ export function scrubHooksJson(
   return {
     content: JSON.stringify(root, null, 2) + "\n",
     fullyEmpty,
+  };
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+interface TemplateHookGroup {
+  matcher?: string;
+  hooks: { type: string; command: string }[];
+}
+
+type TemplateEvents = Record<string, TemplateHookGroup[]>;
+
+/** Match the published invocation in its event, including Snow's trailing argument. */
+function matchesInstalledHook(
+  entry: unknown,
+  template: TemplateHookGroup["hooks"][number],
+  deletedPaths: readonly string[],
+  templateContent: string,
+  installedHash?: string,
+): boolean {
+  if (
+    !isJsonObject(entry) ||
+    entry.type !== "command" ||
+    typeof entry.command !== "string"
+  )
+    return false;
+  const script = template.command.match(
+    /\.(?:zcode|snow)\/hooks\/[\w-]+\.py/,
+  )?.[0];
+  if (!script || !deletedPaths.includes(script)) return false;
+  if (!isDeepStrictEqual({ ...entry, command: template.command }, template))
+    return false;
+  const placeholder = "{{PYTHON_CMD}}";
+  if (!template.command.startsWith(placeholder))
+    return entry.command === template.command;
+  const suffix = template.command.slice(placeholder.length);
+  if (!entry.command.endsWith(suffix)) return false;
+  const launcher = entry.command.slice(0, -suffix.length);
+  // Even another standard launcher may belong to a user hook. Verify the
+  // exact launcher by reconstructing the template recorded at installation.
+  if (!installedHash || !launcher) return false;
+  const encodedLauncher = JSON.stringify(launcher).slice(1, -1);
+  return (
+    computeHash(
+      templateContent.replaceAll(placeholder, () => encodedLauncher),
+    ) === installedHash
+  );
+}
+
+/** Scrub only the event registrations described by this file's shipped template. */
+export function scrubPlatformEventHooks(
+  content: string,
+  deletedPaths: readonly string[],
+  templateContent: string,
+  platform: "snow" | "zcode",
+  installedHash?: string,
+): ScrubResult {
+  let root: unknown;
+  try {
+    root = JSON.parse(content);
+  } catch {
+    return { content, fullyEmpty: false };
+  }
+  if (!isJsonObject(root)) return { content, fullyEmpty: false };
+  const wrapper = platform === "zcode" ? root.hooks : root;
+  if (!isJsonObject(wrapper)) return { content, fullyEmpty: false };
+  const events = platform === "zcode" ? wrapper.events : wrapper;
+  if (!isJsonObject(events)) return { content, fullyEmpty: false };
+
+  const template = JSON.parse(templateContent);
+  const templateEvents: TemplateEvents =
+    platform === "zcode" ? template.hooks.events : template;
+  let changed = false;
+  for (const [event, groups] of Object.entries(templateEvents)) {
+    const entries = events[event];
+    if (!Array.isArray(entries)) continue;
+    const owned = new Set<unknown>();
+    for (const group of groups) {
+      const candidates = entries.flatMap((entry: unknown): unknown[] =>
+        isJsonObject(entry) &&
+        entry.matcher === group.matcher &&
+        Array.isArray(entry.hooks)
+          ? entry.hooks
+          : [],
+      );
+      for (const templateHook of group.hooks) {
+        const matches = candidates.filter((hook) =>
+          matchesInstalledHook(
+            hook,
+            templateHook,
+            deletedPaths,
+            templateContent,
+            installedHash,
+          ),
+        );
+        // The template installed one copy. Identical candidates in the same
+        // scope provide no evidence of which one belongs to the user.
+        if (matches.length === 1) owned.add(matches[0]);
+      }
+    }
+    const remaining = entries.filter((entry: unknown) => {
+      if (!isJsonObject(entry) || !Array.isArray(entry.hooks)) return true;
+      const kept = entry.hooks.filter((hook: unknown) => !owned.has(hook));
+      if (kept.length === entry.hooks.length) return true;
+      changed = true;
+      entry.hooks = kept;
+      // A user description, matcher, or extra group field survives even if
+      // the last managed command has gone. Only prune a shipped wrapper.
+      return (
+        kept.length > 0 ||
+        !groups.some((group) =>
+          isDeepStrictEqual(entry, { ...group, hooks: [] }),
+        )
+      );
+    });
+    if (remaining.length || !entries.length) events[event] = remaining;
+    else Reflect.deleteProperty(events, event);
+  }
+  if (!changed) return { content, fullyEmpty: false };
+  if (platform === "zcode" && Object.keys(events).length === 0) {
+    delete wrapper.events;
+    if (
+      Object.keys(wrapper).length === 0 ||
+      isDeepStrictEqual(wrapper, { enabled: true })
+    )
+      delete root.hooks;
+  }
+  return {
+    content: JSON.stringify(root, null, 2) + "\n",
+    fullyEmpty: Object.keys(root).length === 0,
   };
 }
 

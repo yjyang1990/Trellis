@@ -27,6 +27,8 @@ const { listMdAgents, readTemplate, listFiles } = createTemplateReader(
   import.meta.url,
 );
 
+export { readTemplate as readSnowTemplate };
+
 /** Sub-agent definitions (trellis-implement, trellis-check, trellis-research). */
 export function getAllAgents(): AgentTemplate[] {
   return listMdAgents();

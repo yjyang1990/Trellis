@@ -372,40 +372,8 @@ describe("renameTracesToJournal", () => {
 // rename-dir ownership gate — 🔴-4: never auto-move a user-owned directory
 // =============================================================================
 
-import {
-  classifyMigrations,
-  dirHasManifestEntries,
-} from "../../src/commands/update.js";
+import { classifyMigrations } from "../../src/commands/update.js";
 import type { MigrationItem } from "../../src/types/migration.js";
-
-describe("dirHasManifestEntries", () => {
-  it("is true when the manifest tracks a file under the dir", () => {
-    expect(
-      dirHasManifestEntries(".windsurf/workflows", {
-        ".windsurf/workflows/a.md": "hash",
-      }),
-    ).toBe(true);
-  });
-
-  it("is true on an exact key match", () => {
-    expect(dirHasManifestEntries("AGENTS.md", { "AGENTS.md": "h" })).toBe(true);
-  });
-
-  it("is false when nothing under the dir is tracked", () => {
-    expect(
-      dirHasManifestEntries(".windsurf/workflows", {
-        ".claude/settings.json": "h",
-      }),
-    ).toBe(false);
-  });
-
-  it("does not match a sibling dir that shares a prefix string", () => {
-    // ".devin" must not match ".devinX/..."
-    expect(dirHasManifestEntries(".devin", { ".devinX/a.md": "h" })).toBe(
-      false,
-    );
-  });
-});
 
 describe("classifyMigrations rename-dir ownership gate", () => {
   let tmpDir: string;
@@ -437,8 +405,39 @@ describe("classifyMigrations rename-dir ownership gate", () => {
     expect(result.skip[0].from).toBe(".windsurf/workflows");
   });
 
+  it.each([
+    ".windsurf/workflows/user.md",
+    ".windsurf/workflows",
+    ".windsurf/workflows/trellis-start.md",
+    ".windsurf/workflows-extra/trellis-start.md",
+  ])(
+    "does not infer ownership from an unrelated or missing file %s",
+    (file) => {
+      const result = classifyMigrations(
+        migration,
+        tmpDir,
+        { [file]: "old hash" },
+        new Map(),
+      );
+      expect(result.skip).toEqual(migration);
+    },
+  );
+
+  it("reports a conflict when a file occupies the destination parent", () => {
+    const source = ".windsurf/workflows/trellis-start.md";
+    fs.writeFileSync(path.join(tmpDir, source), "installed");
+    fs.writeFileSync(path.join(tmpDir, ".devin"), "user file");
+    const result = classifyMigrations(migration, tmpDir, { [source]: "hash" }, new Map());
+    expect(result.conflict).toEqual(migration);
+    expect(fs.readFileSync(path.join(tmpDir, source), "utf8")).toBe("installed");
+  });
+
   it("auto-migrates when Trellis owns the source dir (manifest has entries)", () => {
-    const hashes = { ".windsurf/workflows/user.md": "some-hash" };
+    fs.writeFileSync(
+      path.join(tmpDir, ".windsurf/workflows/trellis-start.md"),
+      "installed",
+    );
+    const hashes = { ".windsurf/workflows/trellis-start.md": "some-hash" };
     const result = classifyMigrations(migration, tmpDir, hashes, new Map());
     expect(result.skip).toHaveLength(0);
     expect(result.auto).toHaveLength(1);

@@ -16,7 +16,7 @@
  *
  * Commands:
  *   check-versions [--require-tag]   Verify core/cli (and optional GITHUB_REF
- *                                    tag) all agree on the exact version.
+ *                                    tag) agree and validate its manifest.
  *   npm-tag                          Print the computed npm dist-tag.
  *   publish-plan [--json|--github]   Decide which packages still need a
  *                                    publish. Idempotent: if a package
@@ -44,6 +44,8 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { readMigrationManifest } from "../src/migrations/read-manifest.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -170,6 +172,12 @@ function checkVersions({ requireTag, quiet = false }) {
     fail(
       `Git tag version (${tagVersion}) does not match package version (${v.cliVersion}).`,
     );
+  }
+  try {
+    const manifestDir = path.join(__dirname, "../src/migrations/manifests");
+    readMigrationManifest(path.join(manifestDir, `${v.cliVersion}.json`));
+  } catch (error) {
+    fail(error.message);
   }
   if (!quiet) {
     console.log(

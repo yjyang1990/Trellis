@@ -32,7 +32,7 @@ Before checking, read:
 ## Core Responsibilities
 
 1. **Get code changes** - Use git diff to get uncommitted code
-2. **Check against specs** - Verify code follows guidelines
+2. **Review task artifacts and specs** - Verify the changes meet the task requirements and follow the development guidelines
 3. **Self-fix** - Fix issues yourself, not just report them
 4. **Run verification** - typecheck and lint
 
@@ -53,7 +53,9 @@ git diff --name-only  # List changed files
 git diff              # View specific changes
 ```
 
-### Step 2: Check Against Specs
+### Step 2: Check Against Specs and Task Artifacts
+
+Check the changes against the requirements in `prd.md`, the technical design in `design.md` if present, and the execution plan in `implement.md` if present.
 
 Read relevant specs in `.trellis/spec/` to check code:
 

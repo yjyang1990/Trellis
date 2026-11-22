@@ -189,6 +189,7 @@ describe("trellis template constants", () => {
       gemini: "Gemini",
       qoder: "Qoder",
       copilot: "Copilot",
+      reasonix: "Reasonix",
       trae: "Trae",
       grok: "Grok",
       kimi: "Kimi Code",
@@ -225,8 +226,10 @@ describe("trellis template constants", () => {
       return [label as string];
     });
 
-    const pullBasedLabels = [...generatedPullBasedLabels, "Reasonix"];
-    for (const label of pullBasedLabels) {
+    expect(new Set(generatedPullBasedLabels)).toEqual(
+      new Set(Object.values(workflowLabelByPlatform)),
+    );
+    for (const label of generatedPullBasedLabels) {
       expect(pullBasedBlock, `${label} must use pull-based 2.1 guidance`).toContain(
         label,
       );

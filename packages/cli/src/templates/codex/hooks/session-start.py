@@ -244,13 +244,10 @@ def _get_task_status(trellis_dir: Path, hook_input: dict) -> str:
             "Next: Task directory not found. Run: python3 ./.trellis/scripts/task.py finish"
         )
 
-    task_json_path = task_dir / "task.json"
-    task_data: dict = {}
-    if task_json_path.is_file():
-        try:
-            task_data = json.loads(task_json_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, PermissionError):
-            pass  # Optional task metadata; fall back to generic status.
+    from common.io import read_json_checked  # type: ignore[import-not-found]
+    task_data, _ = read_json_checked(task_dir / "task.json")
+    if task_data is None:
+        return f"Status: TASK ERROR\nTask: {task_ref}\nCheck the active task's task.json."
 
     task_title = task_data.get("title", task_ref)
     task_status = task_data.get("status", "unknown")
@@ -385,15 +382,9 @@ def _build_compact_current_state(
     active = _resolve_active_task(trellis_dir, hook_input)
     if active.task_path:
         task_dir = _resolve_task_dir(trellis_dir, active.task_path)
-        status = "unknown"
-        task_json = task_dir / "task.json"
-        if task_json.is_file():
-            try:
-                data = json.loads(task_json.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    status = str(data.get("status") or "unknown")
-            except (json.JSONDecodeError, OSError):
-                pass  # Optional task metadata; fall back to generic status.
+        from common.io import read_json_checked  # type: ignore[import-not-found]
+        data, _ = read_json_checked(task_dir / "task.json")
+        status = (data or {}).get("status") or "unknown"
         lines.append(f"Current task: {_repo_relative(repo_root, task_dir)}; status={status}.")
     else:
         lines.append("Current task: none.")
@@ -477,18 +468,14 @@ def main() -> None:
         sys.exit(0)
 
     # Read hook input from stdin
-    try:
-        hook_input = json.loads(sys.stdin.read())
-        if not isinstance(hook_input, dict):
-            hook_input = {}
-        project_dir = Path(_normalize_windows_shell_path(hook_input.get("cwd", "."))).resolve()
-    except (json.JSONDecodeError, KeyError):
-        hook_input = {}
-        project_dir = Path(".").resolve()
+    from trellis_hook_io import load_hook_input  # type: ignore[import-not-found]
+    hook_input = load_hook_input()
 
-    configure_project_encoding(project_dir)
-
+    project_dir = Path(_normalize_windows_shell_path(hook_input.get("cwd", "."))).resolve()
     trellis_dir = project_dir / ".trellis"
+    if not (trellis_dir / "scripts" / "common").is_dir():
+        return
+    configure_project_encoding(project_dir)
     spec_index_paths = _collect_spec_index_paths(trellis_dir)
 
     output = StringIO()
@@ -549,4 +536,7 @@ Context loaded. Follow <task-status>. Load workflow/spec/task details only when 
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"Trellis hook skipped ({type(exc).__name__}).", file=sys.stderr)

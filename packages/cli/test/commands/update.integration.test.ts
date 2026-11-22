@@ -10,6 +10,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import inquirer from "inquirer";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { getConfiguredPlatforms } from "../../src/configurators/index.js";
+import { loadHashes } from "../../src/utils/template-hash.js";
 
 // === External dependency mocks (hoisted by vitest) ===
 
@@ -21,7 +25,8 @@ vi.mock("inquirer", () => ({
   default: { prompt: vi.fn().mockResolvedValue({ proceed: true }) },
 }));
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   execSync: vi.fn().mockImplementation((cmd: string) => {
     const py = process.platform === "win32" ? "python" : "python3";
     return cmd === `${py} --version` ? "Python 3.11.12" : "";
@@ -56,7 +61,9 @@ import {
   classifyMigrations,
   executeMigrations,
 } from "../../src/commands/update.js";
-import { VERSION } from "../../src/constants/version.js";
+import { clearManifestCache } from "../../src/migrations/index.js";
+import * as cliVersion from "../../src/constants/version.js";
+const { VERSION } = cliVersion;
 import { DIR_NAMES, FILE_NAMES, PATHS } from "../../src/constants/paths.js";
 import { computeHash } from "../../src/utils/template-hash.js";
 import { workflowMdTemplate } from "../../src/templates/trellis/index.js";
@@ -198,6 +205,64 @@ describe("update() integration", () => {
     vi.unstubAllGlobals();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  it("keeps the installed version when the target manifest is missing", async () => {
+    await setupProject();
+    const target = "99.0.0-missing";
+    vi.spyOn(cliVersion, "VERSION", "get").mockReturnValue(target);
+    await expect(update({ force: true, migrate: true })).rejects.toThrow(`${target}.json`);
+    expect(fs.readFileSync(versionFilePath(), "utf8")).toBe(VERSION);
+  });
+
+  it.each([
+    [
+      Buffer.from(
+        '{"version":"0.2.15","migrations":[{"type":"rename","from":"a"}]}',
+      ),
+      /migrations\[0\]\.to/,
+    ],
+    [
+      Buffer.concat([
+        Buffer.from(
+          '{"version":"0.2.15","migrations":[{"type":"delete","from":"',
+        ),
+        Buffer.from([0xff]),
+        Buffer.from('"}]}'),
+      ]),
+      /utf-8/i,
+    ],
+    [
+      Buffer.from(
+        '{"version":"0.2.15","migrations":[],"breaking":true,"recommendMigrate":true,"aiInstructions":"Check the project"}',
+      ),
+      /migrationGuide/,
+    ],
+    [
+      Buffer.from(
+        '{"version":"0.2.15","migrations":[],"breaking":true,"recommendMigrate":true,"migrationGuide":"Guide","aiInstructions":" "}',
+      ),
+      /aiInstructions/,
+    ],
+  ] as const)(
+    "keeps the installed version when a historical manifest is invalid (%s, %s)",
+    async (bytes, reason) => {
+      await setupProject();
+      stageVersionedUpgradeProject({ fromVersion: "0.2.14" });
+      const originalRead = fs.readFileSync;
+      const historical = path.join("migrations", "manifests", "0.2.15.json");
+      vi.spyOn(fs, "readFileSync").mockImplementation((file, options) => {
+        if (typeof file === "string" && file.endsWith(historical)) {
+          return bytes;
+        }
+        return originalRead(file, options);
+      });
+      clearManifestCache();
+      await expect(update({ force: true, migrate: true })).rejects.toThrow(
+        reason,
+      );
+      expect(fs.readFileSync(versionFilePath(), "utf8")).toBe("0.2.14");
+    },
+  );
 
   it("#1 same version update is a true no-op (zero file changes, no backup)", async () => {
     await setupProject();
@@ -459,16 +524,263 @@ describe("update() integration", () => {
     expect(classified.conflict).toHaveLength(0);
     expect(classified.auto).toHaveLength(1);
 
-    await executeMigrations(classified, tmpDir, { force: true, skipAll: false }, currentTemplates);
+    await executeMigrations(
+      classified,
+      tmpDir,
+      { force: true, skipAll: false },
+      currentTemplates,
+    );
 
     // No duplicate/leftover `.pi/skills/` directory should survive.
     expect(fs.existsSync(projectFile(".pi/skills"))).toBe(false);
 
     // `.agents/skills/` must end up with the correct, current, neutral
     // content — not the stale Pi-flavored bytes from the deleted legacy dir.
-    expect(
-      readProjectFile(".agents/skills/trellis-update-spec/SKILL.md"),
-    ).toBe(neutralContent);
+    expect(readProjectFile(".agents/skills/trellis-update-spec/SKILL.md")).toBe(
+      neutralContent,
+    );
+  });
+
+  const oldSkill = ".pi/skills/trellis-check/SKILL.md";
+  const sharedSkill = ".agents/skills/trellis-check/SKILL.md";
+
+  it.each([
+    ["custom skill", ".pi/skills/my-skill/SKILL.md", false],
+    ["modified skill", oldSkill, false],
+    ["custom skill with force", ".pi/skills/my-skill/SKILL.md", true],
+    ["backup-excluded subtree", ".pi/skills/node_modules/local/file", true],
+  ] as const)(
+    "rename-dir preserves the source containing a %s",
+    async (_, userFile, force) => {
+      await init({ yes: true, force: true, pi: true, codex: true });
+      const target = readProjectFile(sharedSkill);
+      stageVersionedUpgradeProject({
+        fromVersion: "0.6.7",
+        pristineTemplates: { [oldSkill]: "old Pi template" },
+        userModifiedTemplates: { [userFile]: "my edits" },
+      });
+      await update({ migrate: true, force, skipAll: !force });
+      expect(readProjectFile(userFile)).toBe("my edits");
+      expect(readProjectFile(sharedSkill)).toBe(target);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "rename-dir preserves a user symlink inside a tracked source",
+    async () => {
+      await init({ yes: true, force: true, pi: true, codex: true });
+      stageVersionedUpgradeProject({
+        fromVersion: "0.6.7",
+        pristineTemplates: { [oldSkill]: "installed Pi skill" },
+      });
+      const link = projectFile(".pi/skills/local-link");
+      fs.symlinkSync("missing", link);
+      await update({ migrate: true, force: true });
+      expect(fs.readlinkSync(link)).toBe("missing");
+      expect(readProjectFile(oldSkill)).toBe("installed Pi skill");
+    },
+  );
+
+  it("rename-dir keeps target-only skills and refreshes stale shared templates", async () => {
+    await init({ yes: true, force: true, pi: true, codex: true });
+    const codexSkill = ".agents/skills/trellis-continue/SKILL.md";
+    const shared = readProjectFile(sharedSkill);
+    const codex = readProjectFile(codexSkill);
+    stageVersionedUpgradeProject({
+      fromVersion: "0.6.7",
+      pristineTemplates: {
+        [oldSkill]: "old Pi template",
+        [sharedSkill]: "old shared template",
+        [codexSkill]: "old Codex template",
+      },
+    });
+    await update({ migrate: true, skipAll: true });
+    expect(fs.existsSync(projectFile(".pi/skills"))).toBe(false);
+    expect(readProjectFile(sharedSkill)).toBe(shared);
+    expect(readProjectFile(codexSkill)).toBe(codex);
+    const hashes = readHashesV2(hashFilePath());
+    expect(hashes[sharedSkill]).toBe(computeHash(shared));
+    expect(hashes[codexSkill]).toBe(computeHash(codex));
+    expect(hashes[oldSkill]).toBeUndefined();
+    expect(fs.readFileSync(versionFilePath(), "utf8")).toBe(VERSION);
+  });
+
+  it("rename-dir reclassifies a modified file moved into a previously missing template path", async () => {
+    await init({ yes: true, force: true, pi: true });
+    stageVersionedUpgradeProject({
+      fromVersion: "0.6.7",
+      pristineTemplates: { [oldSkill]: "installed Pi template" },
+      userModifiedTemplates: { [oldSkill]: "custom Pi content" },
+    });
+    fs.rmSync(projectFile(".agents/skills"), { recursive: true });
+    const deletedSkill = ".agents/skills/trellis-update-spec/SKILL.md";
+    const hashes = readHashesV2(hashFilePath());
+    const deletedHash = hashes[deletedSkill];
+    writeHashesV2(
+      hashFilePath(),
+      Object.fromEntries(
+        Object.entries(hashes).filter(
+          ([file]) =>
+            !file.startsWith(".agents/skills/") || file === deletedSkill,
+        ),
+      ),
+    );
+    await update({ migrate: true, skipAll: true });
+    expect(fs.existsSync(projectFile(deletedSkill))).toBe(false);
+    expect(readHashesV2(hashFilePath())[deletedSkill]).toBe(deletedHash);
+    expect(fs.existsSync(projectFile(oldSkill))).toBe(false);
+    expect(readProjectFile(sharedSkill)).toBe("custom Pi content");
+    expect(readHashesV2(hashFilePath())[sharedSkill]).toBe(
+      computeHash("installed Pi template"),
+    );
+  });
+
+  it.each([".pi/skills/trellis-continue", ".agents"])(
+    "rename-dir stops before any mutation when %s blocks shared template writes",
+    async (blocker) => {
+      await init({ yes: true, force: true, pi: true, codex: true });
+      const codexSkill = ".agents/skills/trellis-continue/SKILL.md";
+      const expected = readProjectFile(codexSkill);
+      stageVersionedUpgradeProject({
+        fromVersion: "0.6.7",
+        pristineTemplates: { [oldSkill]: "installed Pi skill" },
+      });
+      fs.rmSync(projectFile(".agents"), { recursive: true });
+      writeProjectFile(blocker, "local file");
+      const hashes = Object.fromEntries(
+        Object.entries(readHashesV2(hashFilePath())).filter(
+          ([file]) => !file.startsWith(".agents/"),
+        ),
+      );
+      hashes[".pi/sessions/unrelated"] = "orphan";
+      writeHashesV2(hashFilePath(), hashes);
+      const before = fs.readFileSync(hashFilePath());
+      const options = { migrate: true, skipAll: true };
+      await expect(update(options)).rejects.toThrow(
+        `${blocker} blocks template ${codexSkill}`,
+      );
+      expect(readProjectFile(blocker)).toBe("local file");
+      expect(readProjectFile(oldSkill)).toBe("installed Pi skill");
+      expect(fs.readFileSync(hashFilePath())).toEqual(before);
+      expect(readProjectFile(".trellis/.version")).toBe("0.6.7");
+      expect(fs.existsSync(projectFile(sharedSkill))).toBe(false);
+      expect(
+        fs
+          .readdirSync(projectFile(".trellis"))
+          .filter((name) => name.startsWith(".backup-")),
+      ).toEqual([]);
+
+      fs.renameSync(projectFile(blocker), projectFile("local-file"));
+      await update(options);
+      expect(readProjectFile("local-file")).toBe("local file");
+      expect(readProjectFile(codexSkill)).toBe(expected);
+      expect(readHashesV2(hashFilePath())[codexSkill]).toBe(
+        computeHash(expected),
+      );
+      expect(fs.existsSync(projectFile(oldSkill))).toBe(false);
+      expect(readProjectFile(".trellis/.version")).toBe(VERSION);
+    },
+  );
+
+  it("rename-dir preview preserves manifest bytes and the subsequent migration outcome", async () => {
+    await init({ yes: true, force: true, zcode: true });
+    const source = ".zcode/cli/agents/trellis-check.md";
+    const target = ".zcode/agents/trellis-check.md";
+    stageVersionedUpgradeProject({
+      fromVersion: "0.6.5",
+      pristineTemplates: { [source]: "old agent" },
+    });
+    const hashes = readHashesV2(hashFilePath());
+    hashes[".zcode/cli/agents/custom.md"] = "poisoned";
+    writeHashesV2(hashFilePath(), hashes);
+    const reference = fs.mkdtempSync(
+      path.join(os.tmpdir(), "trellis-no-preview-"),
+    );
+    try {
+      fs.cpSync(tmpDir, reference, { recursive: true });
+      const before = fs.readFileSync(hashFilePath());
+      await update({ dryRun: true });
+      expect(fs.readFileSync(hashFilePath())).toEqual(before);
+      expect(fs.readFileSync(versionFilePath(), "utf8")).toBe("0.6.5");
+      await update({ migrate: true, skipAll: true });
+      vi.mocked(process.cwd).mockReturnValue(reference);
+      await update({ migrate: true, skipAll: true });
+      expect(fs.existsSync(projectFile(source))).toBe(false);
+      expect(fs.existsSync(path.join(reference, source))).toBe(false);
+      expect(readProjectFile(target)).toBe(
+        fs.readFileSync(path.join(reference, target), "utf8"),
+      );
+      expect(readHashesV2(hashFilePath())).toEqual(
+        readHashesV2(path.join(reference, ".trellis/.template-hashes.json")),
+      );
+      expect(
+        readHashesV2(hashFilePath())[".zcode/cli/agents/custom.md"],
+      ).toBeUndefined();
+    } finally {
+      vi.mocked(process.cwd).mockReturnValue(tmpDir);
+      fs.rmSync(reference, { recursive: true, force: true });
+    }
+  });
+
+  it("rename-dir retries after an ordinary upgrade and stops once the source is retired", async () => {
+    await init({ yes: true, force: true, pi: true, codex: true });
+    stageVersionedUpgradeProject({
+      fromVersion: "0.6.7",
+      pristineTemplates: { [oldSkill]: "installed Pi skill" },
+    });
+    await update({ skipAll: true });
+    expect(fs.readFileSync(versionFilePath(), "utf8")).toBe(VERSION);
+    expect(readProjectFile(oldSkill)).toBe("installed Pi skill");
+    const shared = readProjectFile(sharedSkill);
+    writeProjectFile(sharedSkill, "my shared edits");
+    await update({ migrate: true, skipAll: true });
+    expect(readProjectFile(oldSkill)).toBe("installed Pi skill");
+    expect(readProjectFile(sharedSkill)).toBe("my shared edits");
+    writeProjectFile(sharedSkill, shared);
+    await update({ migrate: true, skipAll: true });
+    expect(fs.existsSync(projectFile(".pi/skills"))).toBe(false);
+    expect(readProjectFile(sharedSkill)).toBe(shared);
+    const before = fs.readFileSync(hashFilePath());
+    vi.mocked(console.log).mockClear();
+    await update({ migrate: true, skipAll: true });
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("Already up to date"),
+    );
+    expect(fs.readFileSync(hashFilePath())).toEqual(before);
+  });
+
+  it("rename-dir retry leaves a poisoned Codex-only name under the old Pi root intact", async () => {
+    await init({ yes: true, force: true, pi: true, codex: true });
+    const source = ".pi/skills/trellis-continue/SKILL.md";
+    stageVersionedUpgradeProject({
+      fromVersion: VERSION,
+      pristineTemplates: { [source]: "my local skill" },
+    });
+    await update({ migrate: true, force: true });
+    expect(readProjectFile(source)).toBe("my local skill");
+    expect(readHashesV2(hashFilePath())[source]).toBeUndefined();
+  });
+
+  it("rename-dir retry leaves migrations newer than the installed CLI pending", async () => {
+    await init({ yes: true, force: true, pi: true, codex: true });
+    stageVersionedUpgradeProject({
+      fromVersion: "0.6.7",
+      pristineTemplates: { [oldSkill]: "installed Pi skill" },
+    });
+    const version = vi
+      .spyOn(cliVersion, "VERSION", "get")
+      .mockReturnValue("0.6.7");
+    await update({ migrate: true, force: true });
+    expect(readProjectFile(oldSkill)).toBe("installed Pi skill");
+    expect(readHashesV2(hashFilePath())[oldSkill]).toBe(
+      computeHash("installed Pi skill"),
+    );
+    expect(console.log).not.toHaveBeenCalledWith(
+      expect.stringContaining("Detected incomplete migrations"),
+    );
+    version.mockRestore();
+    await update({ migrate: true, skipAll: true });
+    expect(fs.existsSync(projectFile(oldSkill))).toBe(false);
   });
 
   it("#2 dry run makes no file changes even when changes exist", async () => {
@@ -743,6 +1055,63 @@ describe("update() integration", () => {
     expect(fs.existsSync(newFile)).toBe(true);
     expect(fs.readFileSync(newFile, "utf-8")).toBe(templateContent);
   });
+
+  it.each(["skipAll", "createNew"] as const)(
+    "%s keeps task commands usable with locally edited pre-split task_utils.py",
+    async (policy) => {
+      await setupProject();
+      const scripts = `${PATHS.SCRIPTS}/common`;
+      const utils = `${scripts}/task_utils.py`;
+      const store = `${scripts}/task_store.py`;
+      const nextUtils = readProjectFile(utils);
+      const nextStore = readProjectFile(store);
+      const prior = fs.readFileSync(
+        new URL("./fixtures/pre-rename-split/task_utils.py.txt", import.meta.url),
+        "utf8",
+      );
+      const edited = prior + "\n# Project-specific task helpers\n";
+      stageVersionedUpgradeProject({
+        fromVersion: "0.6.16",
+        pristineTemplates: { [utils]: prior, [store]: "# Prior task store\n" },
+        userModifiedTemplates: { [utils]: edited },
+      });
+      // An installation from before the split has neither these modules nor receipts for them.
+      let hashes = readHashesV2(hashFilePath());
+      for (const name of ["task_rename", "task_store_helpers"]) {
+        const file = `${scripts}/${name}.py`;
+        fs.rmSync(projectFile(file), { force: true });
+        hashes = removeHashEntry(hashes, file);
+      }
+      writeHashesV2(hashFilePath(), hashes);
+
+      await update({ [policy]: true });
+      expect(fs.readFileSync(versionFilePath(), "utf8")).toBe(VERSION);
+      expect(readProjectFile(utils)).toBe(edited);
+      expect(readProjectFile(store)).toBe(nextStore);
+      if (policy === "createNew") {
+        expect(readProjectFile(utils + ".new")).toBe(nextUtils);
+      } else {
+        expect(fs.existsSync(projectFile(utils + ".new"))).toBe(false);
+      }
+
+      const task = (...args: string[]): string => execFileSync(
+        process.platform === "win32" ? "python" : "python3",
+        [projectFile(`${PATHS.SCRIPTS}/task.py`), ...args],
+        { cwd: tmpDir, env: { ...process.env, TRELLIS_DEVELOPER: "tester" }, encoding: "utf8" },
+      ).trim();
+      const parent = task("create", "parent", "--description", "Parent task", "--no-start");
+      const child = task("create", "child", "--description", "Child task", "--parent", parent, "--no-start");
+      const renamed = child.replace(/-child$/, "-renamed");
+      expect(task("list", "--json")).toContain(child);
+      expect(task("rename", child, "renamed", "--dry-run")).toContain(renamed);
+      expect(fs.existsSync(projectFile(child))).toBe(true);
+      expect(fs.existsSync(projectFile(renamed))).toBe(false);
+      task("rename", child, "renamed");
+      expect(fs.existsSync(projectFile(child))).toBe(false);
+      expect(JSON.parse(readProjectFile(`${parent}/task.json`)).children).toEqual([path.basename(renamed)]);
+      expect(JSON.parse(readProjectFile(`${renamed}/task.json`)).parent).toBe(path.basename(parent));
+    },
+  );
 
   it("#8 updates version file after successful update", async () => {
     await setupProject();
@@ -1111,29 +1480,22 @@ describe("update() integration", () => {
     expect(fs.readFileSync(gitattributesPath, "utf-8")).toBe(userContent);
   });
 
-  it("#16 config.yaml update.skip prevents file from being updated", async () => {
-    await setupProject();
+  it.each(["", "  # preserve local prompt"])(
+    "#16 config.yaml update.skip protects a local edit (%s)",
+    async (comment) => {
+      await setupProject();
+      const managed = ".claude/agents/trellis-check.md";
+      const targetPath = path.join(tmpDir, managed);
+      expect(readHashesV2(hashFilePath())[managed]).toBe(computeHash(readProjectFile(managed)));
+      const configPath = path.join(tmpDir, DIR_NAMES.WORKFLOW, "config.yaml");
+      fs.appendFileSync(configPath, `\nupdate:\n  skip:\n    - ${managed}${comment}\n`);
+      fs.writeFileSync(targetPath, "# modified by user\n");
 
-    // Pick a managed template file
-    const targetPath = path.join(tmpDir, MANAGED_FILE);
+      await update({ force: true });
 
-    // Add skip config
-    const configPath = path.join(tmpDir, DIR_NAMES.WORKFLOW, "config.yaml");
-    const configContent = fs.readFileSync(configPath, "utf-8");
-    fs.writeFileSync(
-      configPath,
-      configContent + `\nupdate:\n  skip:\n    - ${MANAGED_FILE}\n`,
-    );
-
-    // Modify the file so it would normally trigger a change
-    fs.writeFileSync(targetPath, "# modified by user\n");
-
-    // Run update
-    await update({ force: true });
-
-    // File should NOT be overwritten (it's in skip list)
-    expect(fs.readFileSync(targetPath, "utf-8")).toBe("# modified by user\n");
-  });
+      expect(readProjectFile(managed)).toBe("# modified by user\n");
+    },
+  );
 
   it("#17 config.yaml update.skip with directory path skips all files under it", async () => {
     await setupProject();
@@ -1375,6 +1737,257 @@ describe("update() integration", () => {
       force: true,
     });
   }
+
+  function stageFlat040Claude(): void {
+    const fixture = new URL("./fixtures/legacy-040/", import.meta.url);
+    for (const [source, dest] of [
+      ["settings.json", ".claude/settings.json"],
+      ["ralph-loop.py.txt", ".claude/hooks/ralph-loop.py"],
+      ["flat-hashes.json", ".trellis/.template-hashes.json"],
+    ]) {
+      writeProjectFile(dest, fs.readFileSync(new URL(source, fixture), "utf8"));
+    }
+    writeProjectFile(".trellis/.version", "0.4.0");
+  }
+
+  it("converts a released Windows flat receipt only on apply and only for shipped bytes", async () => {
+    stageFlat040Claude();
+    const settingsPath = ".claude/settings.json";
+    const windowsSettings = readProjectFile(settingsPath)
+      .replaceAll("python3 ", "python ")
+      .replace(/\r?\n/g, "\r\n");
+    writeProjectFile(settingsPath, windowsSettings);
+    writeProjectFile(".claude/custom.md", "user file");
+    writeProjectFile(".codex/config.toml", "user config");
+    const rawHash = (text: string) =>
+      createHash("sha256").update(text).digest("hex");
+    const flat = {
+      ".claude\\settings.json": rawHash(windowsSettings),
+      ".claude/custom.md": rawHash("user file"),
+      ".codex/config.toml": rawHash("user config"),
+      "../outside": rawHash(windowsSettings),
+    };
+    const receipt = JSON.stringify(flat);
+    fs.writeFileSync(hashFilePath(), receipt);
+    expect(loadHashes(tmpDir)).toEqual({});
+    expect(getConfiguredPlatforms(tmpDir).size).toBe(0);
+    await update({ migrate: true, dryRun: true });
+    expect(fs.readFileSync(hashFilePath(), "utf8")).toBe(receipt);
+    expect(readProjectFile(settingsPath)).toBe(windowsSettings);
+    await update({ migrate: true, skipAll: true });
+    expect(readProjectFile(settingsPath)).toContain("UserPromptSubmit");
+    expect(getConfiguredPlatforms(tmpDir)).toEqual(new Set(["claude-code"]));
+    const hashes = readHashesV2(hashFilePath());
+    for (const key of [
+      ".codex/config.toml",
+      ".claude/custom.md",
+      "../outside",
+    ]) {
+      expect(hashes).not.toHaveProperty([key]);
+    }
+    expect(readProjectFile(".codex/config.toml")).toBe("user config");
+    vi.mocked(console.log).mockClear();
+    await update({ migrate: true, skipAll: true });
+    expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain(
+      "Already up to date",
+    );
+  });
+
+  it.each([
+    [false, false],
+    [false, true],
+    [true, true],
+  ])(
+    "requires a Trellis-specific receipt to upgrade the native OpenCode package (selected=%s, empty stub=%s)",
+    async (selected, stub) => {
+      const packagePath = ".opencode/package.json";
+      const commandPath = ".opencode/commands/trellis/before-dev.md";
+      const original =
+        '{\n  "dependencies": {\n    "@opencode-ai/plugin": "1.1.40"\n  }\n}\n';
+      const hashes = { [packagePath]: computeHash(original) };
+      writeProjectFile(packagePath, original);
+      if (stub) {
+        const empty = ".opencode/commands/trellis/migrate-specs.md";
+        hashes[empty] = computeHash("");
+        writeProjectFile(empty, "");
+      }
+      if (selected) {
+        const released = fs.readFileSync(
+          new URL(
+            "./fixtures/legacy-040/opencode-before-dev.txt",
+            import.meta.url,
+          ),
+          "utf8",
+        );
+        writeProjectFile(commandPath, released);
+        hashes[commandPath] = computeHash(released);
+      }
+      writeProjectFile(".trellis/.version", "0.4.0");
+      writeProjectFile(
+        ".trellis/.template-hashes.json",
+        JSON.stringify(hashes),
+      );
+      await update({ migrate: true, force: true });
+      expect(getConfiguredPlatforms(tmpDir).has("opencode")).toBe(selected);
+      expect(Object.hasOwn(readHashesV2(hashFilePath()), packagePath)).toBe(
+        selected,
+      );
+      expect(readProjectFile(packagePath) === original).toBe(!selected);
+    },
+  );
+
+  it("resumes the Qoder upgrade after saving the real converted v2 receipt", async () => {
+    const source = ".qoder/skills/before-dev/SKILL.md";
+    const released = fs.readFileSync(
+      new URL("./fixtures/legacy-040/qoder-before-dev.txt", import.meta.url),
+      "utf8",
+    );
+    writeProjectFile(source, released);
+    writeProjectFile(".trellis/.version", "0.4.0");
+    writeProjectFile(
+      ".trellis/.template-hashes.json",
+      JSON.stringify({ [source]: computeHash(released) }),
+    );
+    const control = fs.mkdtempSync(
+      path.join(os.tmpdir(), "trellis-qoder-control-"),
+    );
+    try {
+      fs.cpSync(tmpDir, control, { recursive: true });
+      const rename = fs.renameSync;
+      const interrupt = vi
+        .spyOn(fs, "renameSync")
+        .mockImplementation((from, to) => {
+          rename(from, to);
+          if (to === hashFilePath())
+            throw new Error("interrupted after receipt conversion");
+        });
+      await expect(update({ migrate: true, skipAll: true })).rejects.toThrow(
+        "interrupted after receipt conversion",
+      );
+      interrupt.mockRestore();
+      expect(readHashesV2(hashFilePath())[source]).toBe(computeHash(released));
+      expect(readProjectFile(source)).toBe(released);
+      expect(readProjectFile(".trellis/.version")).toBe("0.4.0");
+      await update({ migrate: true, skipAll: true });
+      vi.mocked(process.cwd).mockReturnValue(control);
+      await update({ migrate: true, skipAll: true });
+      expect(readHashesV2(hashFilePath())).toEqual(
+        readHashesV2(path.join(control, ".trellis/.template-hashes.json")),
+      );
+      for (const file of [
+        ".trellis/.version",
+        ".qoder/settings.json",
+        ".qoder/hooks/session-start.py",
+      ]) {
+        expect(readProjectFile(file)).toBe(
+          fs.readFileSync(path.join(control, file), "utf8"),
+        );
+      }
+    } finally {
+      fs.rmSync(control, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ".trellis/.template-hashes.json",
+    ".claude/settings.json",
+    ".claude/hooks",
+  ])(
+    "stops before converting a legacy installation with a linked %s",
+    async (linked) => {
+      stageFlat040Claude();
+      const receipt = fs.readFileSync(hashFilePath());
+      fs.renameSync(projectFile(linked), projectFile(`${linked}-original`));
+      fs.symlinkSync(
+        projectFile(`${linked}-original`),
+        projectFile(linked),
+        linked.endsWith("hooks") ? "junction" : "file",
+      );
+      await expect(update({ migrate: true, skipAll: true })).rejects.toThrow(
+        linked,
+      );
+      expect(fs.readFileSync(hashFilePath())).toEqual(receipt);
+      expect(readProjectFile(".trellis/.version")).toBe("0.4.0");
+    },
+  );
+
+  it("keeps future receipt schemas outside the 0.4.0 converter", async () => {
+    writeProjectFile(".trellis/.version", "0.4.0");
+    writeProjectFile(".claude/settings.json", "{}");
+    writeProjectFile(
+      ".trellis/.template-hashes.json",
+      JSON.stringify({
+        __version: 3,
+        ".claude/settings.json":
+          "f468342f1ebfef18dbbde0a2528366b32ec154befca880e0c8b29fefdcccb1bf",
+      }),
+    );
+    await update({ migrate: true, skipAll: true });
+    expect(getConfiguredPlatforms(tmpDir).size).toBe(0);
+    expect(
+      fs.existsSync(projectFile(".claude/hooks/inject-workflow-state.py")),
+    ).toBe(false);
+  });
+
+  it("keeps the script when local Claude settings also reference it", async () => {
+    stageFlat040Claude();
+    const localSettings = readProjectFile(".claude/settings.json");
+    writeProjectFile(".claude/settings.local.json", localSettings);
+    await expect(update({ migrate: true, force: true })).rejects.toThrow(
+      ".claude/settings.local.json",
+    );
+    expect(readProjectFile(".claude/settings.local.json")).toBe(localSettings);
+    expect(fs.existsSync(projectFile(".claude/hooks/ralph-loop.py"))).toBe(
+      true,
+    );
+  });
+
+  it.each(["skipAll", "createNew"] as const)(
+    "0.4.0 %s preserves custom settings while retiring the released hook",
+    async (policy) => {
+      stageFlat040Claude();
+      const settingsPath = ".claude/settings.json";
+      const settings = JSON.parse(readProjectFile(settingsPath));
+      const customHook = { type: "command", command: "my-check" };
+      settings.hooks.SubagentStop[0].hooks.push(customHook);
+      settings.theme = "dark";
+      writeProjectFile(settingsPath, JSON.stringify(settings));
+      await update({ migrate: true, [policy]: true });
+      const active = JSON.parse(readProjectFile(settingsPath));
+      expect(active.theme).toBe("dark");
+      expect(active.hooks.SubagentStop[0].hooks).toEqual([customHook]);
+      expect(fs.existsSync(projectFile(".claude/hooks/ralph-loop.py"))).toBe(
+        false,
+      );
+      expect(
+        fs.existsSync(projectFile(".claude/hooks/inject-workflow-state.py")),
+      ).toBe(true);
+      expect(fs.existsSync(projectFile(`${settingsPath}.new`))).toBe(
+        policy === "createNew",
+      );
+    },
+  );
+
+  it("stops before changing a 0.4.0 receipt or deleting a hook with an ambiguous reference", async () => {
+    stageFlat040Claude();
+    const receipt = fs.readFileSync(hashFilePath());
+    const settingsPath = ".claude/settings.json";
+    writeProjectFile(
+      settingsPath,
+      readProjectFile(settingsPath).replace(
+        "ralph-loop.py",
+        "ralph-loop.py --custom",
+      ),
+    );
+    await expect(update({ migrate: true, skipAll: true })).rejects.toThrow(
+      settingsPath,
+    );
+    expect(fs.existsSync(projectFile(".claude/hooks/ralph-loop.py"))).toBe(
+      true,
+    );
+    expect(fs.readFileSync(hashFilePath())).toEqual(receipt);
+    expect(fs.readFileSync(versionFilePath(), "utf8")).toBe("0.4.0");
+  });
 
   it("#22 breaking-change gate exits 1 when --migrate is missing", async () => {
     await setupProject();

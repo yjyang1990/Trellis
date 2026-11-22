@@ -32,14 +32,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Hook hosts send UTF-8 JSON regardless of the process locale.
-_stdin_reconfigure = getattr(sys.stdin, "reconfigure", None)
-if callable(_stdin_reconfigure):
-    try:
-        _stdin_reconfigure(encoding="utf-8", errors="replace")
-    except (OSError, ValueError):
-        pass
-
 # IMPORTANT: Force stdout to use UTF-8 on Windows
 # This fixes UnicodeEncodeError when outputting non-ASCII characters
 if sys.platform.startswith("win"):
@@ -798,7 +790,7 @@ To get structured package info, run: `python3 ./{DIR_WORKFLOW}/scripts/get_conte
 
 - Spec files: `{spec_path}/**/*.md`
 - Code search: Use Glob and Grep tools
-- Tech solutions: Use mcp__exa__web_search_exa or mcp__exa__get_code_context_exa"""
+- External research: Use available web or documentation search tools as needed."""
 
     context_parts.append(project_structure)
 
@@ -813,7 +805,7 @@ You are the Research Agent in the Multi-Agent Pipeline (search researcher).
 
 ## Core Principle
 
-**You do one thing: find and explain information.**
+**You do one thing: find, explain, and persist information.**
 
 You are a documenter, not a reviewer.
 
@@ -834,7 +826,7 @@ You are a documenter, not a reviewer.
 1. **Understand query** - Determine search type (internal/external) and scope
 2. **Plan search** - List search steps for complex queries
 3. **Execute search** - Execute multiple independent searches in parallel
-4. **Organize results** - Output structured report
+4. **Organize results** - Save each topic in the current task’s research directory
 
 ## Search Tools
 
@@ -843,26 +835,14 @@ You are a documenter, not a reviewer.
 | Glob | Search by filename pattern |
 | Grep | Search by content |
 | Read | Read file content |
-| mcp__exa__web_search_exa | External web search |
-| mcp__exa__get_code_context_exa | External code/doc search |
 
 ## Strict Boundaries
 
-**Only allowed**: Describe what exists, where it is, how it works
+Resolve the active task with `task.py current --source`. If there is no active task, ask where to save the findings.
 
-**Forbidden** (unless explicitly asked):
-- Suggest improvements
-- Criticize implementation
-- Recommend refactoring
-- Modify any files
+Create the current task’s `research/` directory if needed. Write findings only to `{{TASK_DIR}}/research/*.md`. All other files are read-only.
 
-## Report Format
-
-Provide structured search results including:
-- List of files found (with paths)
-- Code pattern analysis (if applicable)
-- Related spec documents
-- External references (if any)"""
+Return each file path and a one-line summary to the caller."""
 
 
 def _string_value(value: Any) -> str:
@@ -931,7 +911,7 @@ def _handle_codex_subagent_start(input_data: dict) -> None:
         repo_root = find_repo_root(candidate)
         if repo_root:
             break
-    if not repo_root:
+    if not repo_root or not (Path(repo_root) / ".trellis" / "scripts" / "common").is_dir():
         return
 
     task_dir = get_current_task(
@@ -1093,12 +1073,10 @@ def main():
     if os.environ.get("TRELLIS_HOOKS") == "0" or os.environ.get("TRELLIS_DISABLE_HOOKS") == "1":
         sys.exit(0)
 
-    try:
-        input_data = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        sys.exit(0)
-    if not isinstance(input_data, dict):
-        sys.exit(0)
+    from trellis_hook_io import load_hook_input
+    input_data = load_hook_input()
+    if not input_data:
+        return
 
     if _hook_event_name(input_data) == "SubagentStart":
         try:
@@ -1118,8 +1096,8 @@ def main():
 
     # Find repo root
     repo_root = find_repo_root(cwd)
-    if not repo_root:
-        sys.exit(0)
+    if not repo_root or not (Path(repo_root) / ".trellis" / "scripts" / "common").is_dir():
+        return
 
     # Get current task directory (research doesn't require it)
     task_dir = get_current_task(repo_root, input_data)
@@ -1209,4 +1187,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"Trellis hook skipped ({type(exc).__name__}).", file=sys.stderr)

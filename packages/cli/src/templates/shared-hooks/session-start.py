@@ -442,13 +442,10 @@ def _get_task_status(trellis_dir: Path, input_data: dict) -> str:
             "then ask the user what to work on next."
         )
 
-    task_json_path = task_dir / "task.json"
-    task_data = {}
-    if task_json_path.is_file():
-        try:
-            task_data = json.loads(task_json_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, PermissionError):
-            pass  # Optional task metadata; fall back to generic status.
+    from common.io import read_json_checked  # type: ignore[import-not-found]
+    task_data, _ = read_json_checked(task_dir / "task.json")
+    if task_data is None:
+        return f"Status: TASK ERROR\nTask: {task_ref}\nCheck the active task's task.json."
 
     task_title = task_data.get("title", task_ref)
     task_status = task_data.get("status", "unknown")
@@ -541,16 +538,11 @@ def _load_trellis_config(trellis_dir: Path, input_data: dict) -> tuple:
             platform=_detect_platform(input_data),
         )
         if current:
-            task_json = repo_root / current / "task.json"
-            if task_json.is_file():
-                try:
-                    data = json.loads(task_json.read_text(encoding="utf-8"))
-                    if isinstance(data, dict):
-                        tp = data.get("package")
-                        if isinstance(tp, str) and tp:
-                            task_pkg = tp
-                except (json.JSONDecodeError, OSError):
-                    pass  # Optional package metadata; fall back to default scope.
+            from common.io import read_json_checked  # type: ignore[import-not-found]
+            data, _ = read_json_checked(repo_root / current / "task.json")
+            tp = (data or {}).get("package")
+            if isinstance(tp, str) and tp:
+                task_pkg = tp
 
         default_pkg = get_default_package(repo_root)
         return is_mono, packages, scope, task_pkg, default_pkg
@@ -719,15 +711,9 @@ def _build_compact_current_state(
     active = _resolve_active_task(trellis_dir, input_data)
     if active.task_path:
         task_dir = _resolve_task_dir(trellis_dir, active.task_path)
-        status = "unknown"
-        task_json = task_dir / "task.json"
-        if task_json.is_file():
-            try:
-                data = json.loads(task_json.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    status = str(data.get("status") or "unknown")
-            except (json.JSONDecodeError, OSError):
-                pass  # Optional task metadata; fall back to generic status.
+        from common.io import read_json_checked  # type: ignore[import-not-found]
+        data, _ = read_json_checked(task_dir / "task.json")
+        status = (data or {}).get("status") or "unknown"
         lines.append(f"Current task: {_repo_relative(repo_root, task_dir)}; status={status}.")
     else:
         lines.append("Current task: none.")
@@ -823,12 +809,8 @@ def main():
     if should_skip_injection():
         sys.exit(0)
 
-    try:
-        hook_input = json.loads(sys.stdin.read())
-        if not isinstance(hook_input, dict):
-            hook_input = {}
-    except (json.JSONDecodeError, ValueError):
-        hook_input = {}
+    from trellis_hook_io import load_hook_input  # type: ignore[import-not-found]
+    hook_input = load_hook_input()
 
     # Try platform-specific env vars, hook cwd, fallback to cwd
     project_dir_env_vars = [
@@ -853,6 +835,8 @@ def main():
         project_dir = Path(_normalize_windows_shell_path(hook_input.get("cwd", "."))).resolve()
 
     trellis_dir = project_dir / ".trellis"
+    if not (trellis_dir / "scripts" / "common").is_dir():
+        return
     context_key = _resolve_context_key(trellis_dir, hook_input)
     _persist_context_key_for_bash(context_key)
 
@@ -946,4 +930,7 @@ Context loaded. Follow <task-status>. Load workflow/spec/task details only when 
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"Trellis hook skipped ({type(exc).__name__}).", file=sys.stderr)

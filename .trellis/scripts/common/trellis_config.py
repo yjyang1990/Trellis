@@ -18,6 +18,7 @@ and skipped rather than parsed into a plausible-looking wrong value.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -38,17 +39,17 @@ def _strip_inline_comment(value: str) -> str:
     YAML treats ` #` (space-hash) as a comment opener; bare `#` inside a token
     is part of the value. Quoted strings are immune.
     """
-    in_quote: str | None = None
+    quote = None
     for idx, ch in enumerate(value):
-        if in_quote:
-            if ch == in_quote:
-                in_quote = None
-            continue
-        if ch in ('"', "'"):
-            in_quote = ch
-            continue
-        if ch == "#" and (idx == 0 or value[idx - 1].isspace()):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch == "#" and (idx == 0 or value[idx - 1].isspace()):
             return value[:idx]
+        elif ch in ('"', "'"):
+            if ch == "'" and idx and (value[idx - 1].isalnum() or value[idx - 1] == "_"):
+                continue
+            quote = ch
     return value
 
 
@@ -104,92 +105,76 @@ def _skip_indented_body(lines: list[str], start: int, indent: int) -> int:
     i = start
     while i < len(lines):
         stripped = lines[i].strip()
-        if stripped and len(lines[i]) - len(lines[i].lstrip()) <= indent:
+        if stripped and not stripped.startswith("#") and len(lines[i]) - len(lines[i].lstrip()) <= indent:
             break
         i += 1
     return i
+
+
+def _is_list_item(text: str) -> bool:
+    return text == "-" or bool(re.match(r"^-\s", text))
 
 
 def _parse_yaml_block(
     lines: list[str], start: int, min_indent: int, target: dict, source: str
 ) -> int:
     i = start
-    current_list: list | None = None
-    # Indent of the key that opened current_list, so a deeper `key: value`
-    # can be recognized as a mapping inside that list.
-    list_owner_indent = 0
-
     while i < len(lines):
-        line = lines[i]
+        i, line = _next_content_line(lines, i)
+        if not line:
+            break
         stripped = line.strip()
-
-        if not stripped or stripped.startswith("#"):
-            i += 1
-            continue
-
         indent = len(line) - len(line.lstrip())
         if indent < min_indent:
             break
+        if indent != min_indent or ":" not in stripped or _is_list_item(stripped):
+            _warn_unsupported(source, i + 1, line, "unexpected indentation or mapping entry")
+            i = _skip_indented_body(lines, i + 1, indent)
+            continue
 
-        if stripped.startswith("- "):
-            if current_list is not None:
-                current_list.append(_unquote(stripped[2:].strip()))
-            i += 1
-        elif ":" in stripped:
-            if current_list is not None and indent > list_owner_indent:
-                # `- name: cli` / `  path: x`: the second key belongs to a
-                # mapping inside the list. Storing it would hoist it into the
-                # parent dict as a sibling of the list — a nested key silently
-                # becoming a root key.
-                _warn_unsupported(
-                    source,
-                    i + 1,
-                    line,
-                    "mappings inside a list are not supported",
-                )
-                i += 1
-                continue
+        key, _, value = stripped.partition(":")
+        key = key.strip()
+        value = _strip_inline_comment(value).strip()
+        reason = _unsupported_value(key, value)
+        if not key or reason or value:
+            if reason:
+                _warn_unsupported(source, i + 1, line, reason)
+            elif key:
+                target[key] = _unquote(value)
+            i = _skip_indented_body(lines, i + 1, indent)
+            continue
 
-            key, _, value = stripped.partition(":")
-            key = key.strip()
-            value = _strip_inline_comment(value).strip()
-            was_quoted = len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'")
-
-            if not was_quoted:
-                reason = _unsupported_value(key, value)
-                if reason is not None:
-                    _warn_unsupported(source, i + 1, line, reason)
-                    current_list = None
-                    i = _skip_indented_body(lines, i + 1, indent)
-                    continue
-
-            value = _unquote(value)
-            current_list = None
-
-            if value or was_quoted:
-                target[key] = value
-                i += 1
-            else:
-                next_i, next_line = _next_content_line(lines, i + 1)
-                if next_i >= len(lines):
-                    target[key] = {}
-                    i = next_i
-                elif next_line.strip().startswith("- "):
-                    current_list = []
-                    list_owner_indent = indent
-                    target[key] = current_list
-                    i += 1
-                else:
-                    next_indent = len(next_line) - len(next_line.lstrip())
-                    if next_indent > indent:
-                        nested: dict = {}
-                        target[key] = nested
-                        i = _parse_yaml_block(lines, i + 1, next_indent, nested, source)
-                    else:
-                        target[key] = {}
-                        i += 1
+        i, next_line = _next_content_line(lines, i + 1)
+        next_indent = len(next_line) - len(next_line.lstrip())
+        if next_indent >= indent and _is_list_item(next_line.strip()):
+            items: list[str] = []
+            while i < len(lines):
+                i, item = _next_content_line(lines, i)
+                if len(item) - len(item.lstrip()) != next_indent or not _is_list_item(item.strip()):
+                    break
+                value = _strip_inline_comment(item.strip()[1:]).strip()
+                reason = _unsupported_value("", value)
+                quoted = len(value) > 1 and value[0] == value[-1] and value[0] in ('"', "'")
+                if _is_list_item(value):
+                    reason = "nested lists are not supported"
+                elif (not quoted and re.search(r":(?:\s|$)", value)) or re.match(
+                    r"""^(?:"[^"]*"|'[^']*')\s*:(?:\s|$)""", value
+                ):
+                    reason = "mappings inside a list are not supported"
+                _, following = _next_content_line(lines, i + 1)
+                if not reason and len(following) - len(following.lstrip()) > next_indent:
+                    reason = "continuations inside a list item are not supported"
+                if reason:
+                    _warn_unsupported(source, i + 1, item, reason)
+                elif value:
+                    items.append(_unquote(value))
+                i = _skip_indented_body(lines, i + 1, next_indent)
+            target[key] = items
         else:
-            i += 1
+            nested: dict = {}
+            target[key] = nested
+            if next_indent > indent:
+                i = _parse_yaml_block(lines, i, next_indent, nested, source)
 
     return i
 
@@ -207,7 +192,7 @@ def parse_simple_yaml(content: str, source: str = "config.yaml") -> dict:
             nested_key2:
               - item
 
-    Uses indentation to detect nesting (2+ spaces deeper = child). Every value
+    Uses indentation to detect nesting (deeper = child). Every value
     is a string; consumers coerce. Unsupported constructs are reported on
     stderr against ``source`` and skipped — see the module docstring.
 

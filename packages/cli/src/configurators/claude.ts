@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { AI_TOOLS } from "../types/ai-tools.js";
+import { readAgentTemplate } from "../templates/read-agent-template.js";
 import { getClaudeTemplatePath } from "../templates/extract.js";
 import {
   getSettingsTemplate,
@@ -82,7 +83,10 @@ function walkClaudeTemplateDir(): Map<string, string> {
         if (relEntry === "commands" || relEntry === "hooks") continue;
         walk(relEntry);
       } else {
-        const content = readFileSync(absEntry, "utf-8");
+        const content =
+          relDir === "agents" && entry.endsWith(".md")
+            ? readAgentTemplate(absEntry)
+            : readFileSync(absEntry, "utf-8");
         // Map keys are logical paths used as cross-platform hash keys
         // downstream. Always POSIX, regardless of host OS.
         files.set(

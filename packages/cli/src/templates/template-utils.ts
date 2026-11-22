@@ -6,6 +6,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readAgentTemplate } from "./read-agent-template.js";
 
 export interface AgentTemplate {
   name: string;
@@ -55,7 +56,7 @@ export function createTemplateReader(importMetaUrl: string): TemplateReader {
       .filter((f) => f.endsWith(".md"))
       .map((f) => ({
         name: f.replace(".md", ""),
-        content: readTemplate(`${dir}/${f}`),
+        content: readAgentTemplate(join(__dirname, dir, f)),
       }));
   }
 

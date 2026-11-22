@@ -15,6 +15,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { configMap, parseTrellisConfig } from "../../utils/trellis-config.js";
 import { DIR_NAMES } from "../../constants/paths.js";
 
 /** Top-level `.trellis/*` entries eligible for symlink auto-trust. */
@@ -28,80 +29,23 @@ interface ChannelTrustConfig {
 /**
  * Parse the `channel.trusted_context_dirs` (list) and
  * `channel.auto_trust_trellis_symlinks` (bool) keys out of
- * `.trellis/config.yaml`. Mirrors the lightweight line-scanner used by
- * `loadWorkerGuardConfig` in guard.ts — no YAML dependency.
+ * `.trellis/config.yaml`.
  */
 export function parseChannelTrustSection(content: string): ChannelTrustConfig {
-  const lines = content.split("\n");
-  const trustedDirs: string[] = [];
+  const channel = configMap(parseTrellisConfig(content).channel);
+  const dirs = channel.trusted_context_dirs;
+  const trustedDirs = Array.isArray(dirs) ? dirs.filter(Boolean) : [];
   let autoTrustSymlinks: boolean | undefined;
-
-  let inChannel = false;
-  let inList = false;
-
-  for (const raw of lines) {
-    const line = raw.replace(/\r$/, "");
-    const trimmed = line.trimEnd();
-    if (trimmed.trim().startsWith("#")) continue;
-
-    if (/^channel:\s*$/.test(trimmed)) {
-      inChannel = true;
-      inList = false;
-      continue;
-    }
-
-    if (!inChannel) continue;
-
-    // Anything at column 0 (non-blank) ends the `channel:` section.
-    if (trimmed.trim() !== "" && /^\S/.test(line)) {
-      inChannel = false;
-      inList = false;
-      continue;
-    }
-
-    if (trimmed.trim() === "") continue;
-
-    if (inList) {
-      const item = trimmed.match(/^ {4}-\s*(.+)$/);
-      if (item) {
-        const val = stripTrustValue(item[1]);
-        if (val) trustedDirs.push(val);
-        continue;
-      }
-      // Anything else at <= list-header indent ends the list.
-      inList = false;
-    }
-
-    if (/^ {2}trusted_context_dirs:\s*$/.test(trimmed)) {
-      inList = true;
-      continue;
-    }
-
-    const boolMatch = trimmed.match(
-      /^ {2}auto_trust_trellis_symlinks:\s*(.+)$/,
-    );
-    if (boolMatch) {
-      const val = stripTrustValue(boolMatch[1]).toLowerCase();
-      if (val === "false") autoTrustSymlinks = false;
-      else if (val === "true") autoTrustSymlinks = true;
-      else {
-        process.stderr.write(
-          `[channel] channel.auto_trust_trellis_symlinks: invalid value '${val}', ignoring\n`,
-        );
-      }
-      continue;
-    }
+  if (typeof channel.auto_trust_trellis_symlinks === "string") {
+    const val = channel.auto_trust_trellis_symlinks.toLowerCase();
+    if (val === "false") autoTrustSymlinks = false;
+    else if (val === "true") autoTrustSymlinks = true;
+    else
+      process.stderr.write(
+        `[channel] channel.auto_trust_trellis_symlinks: invalid value '${val}', ignoring\n`,
+      );
   }
-
   return { trustedDirs, autoTrustSymlinks };
-}
-
-function stripTrustValue(s: string): string {
-  return s
-    .trim()
-    .replace(/\s*#.*$/, "")
-    .trim()
-    .replace(/^['"]|['"]$/g, "");
 }
 
 function loadChannelTrustConfig(cwd: string): ChannelTrustConfig {

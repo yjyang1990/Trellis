@@ -12,7 +12,8 @@ vi.mock("inquirer", () => ({
   default: { prompt: vi.fn() },
 }));
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   execSync: vi.fn().mockImplementation((cmd: string) => {
     const python = process.platform === "win32" ? "python" : "python3";
     return cmd === `${python} --version` ? "Python 3.11.12" : "";
@@ -20,6 +21,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 import { ablate, restore } from "../../src/commands/ablate.js";
+import { uninstall } from "../../src/commands/uninstall.js";
 import { init } from "../../src/commands/init.js";
 import {
   ABLATION_STATE_ROOT_ENV,
@@ -132,6 +134,64 @@ describe("ablate()/restore() integration", () => {
       false,
     );
   });
+
+  it.each(["uninstall", "ablate"] as const)(
+    "%s keeps user hooks beside Trellis hooks in ZCode and all Snow events",
+    async (action) => {
+      await init({ yes: true, zcode: true, snow: true, force: true });
+      const userHook = { type: "command", command: "echo mine" };
+      const otherEvent = [
+        { hooks: [{ type: "command", command: "echo other" }] },
+      ];
+      const expected = new Map<string, unknown>();
+      const zcodePath = path.join(projectDir, ".zcode/config.json");
+      const config = JSON.parse(fs.readFileSync(zcodePath, "utf8"));
+      config.model = "my-model";
+      const session = config.hooks.events.SessionStart[0];
+      session.hooks.push(userHook);
+      config.hooks.events.Other = otherEvent;
+      fs.writeFileSync(zcodePath, JSON.stringify(config));
+      expected.set(zcodePath, {
+        model: "my-model",
+        hooks: {
+          enabled: true,
+          events: {
+            SessionStart: [{ ...session, hooks: [userHook] }],
+            Other: otherEvent,
+          },
+        },
+      });
+      for (const event of [
+        "beforeSubAgentStart",
+        "onSessionStart",
+        "onUserMessage",
+      ]) {
+        const file = path.join(projectDir, `.snow/hooks/${event}.json`);
+        const snow = JSON.parse(fs.readFileSync(file, "utf8"));
+        const group = snow[event][0];
+        group.hooks.push(userHook);
+        snow.other = otherEvent;
+        fs.writeFileSync(file, JSON.stringify(snow));
+        expected.set(file, {
+          [event]: [{ ...group, hooks: [userHook] }],
+          other: otherEvent,
+        });
+      }
+
+      const before = projectFingerprint();
+      const remove = action === "uninstall" ? uninstall : ablate;
+      await remove({ dryRun: true });
+      expect(projectFingerprint()).toEqual(before);
+      await remove({ yes: true });
+      for (const [file, remaining] of expected) {
+        expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(remaining);
+      }
+      if (action === "ablate") {
+        await restore({ yes: true });
+        expect(projectFingerprint()).toEqual(before);
+      }
+    },
+  );
 
   it("#2 dry-run creates no recovery state and changes no project path", async () => {
     await initialize();

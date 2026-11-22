@@ -84,12 +84,7 @@ describe("trae getAllAgents", () => {
 describe("trae sub-agent recursion guard", () => {
   for (const name of ["trellis-implement", "trellis-check"] as const) {
     it(`${name}.md forbids spawning trellis-implement / trellis-check`, () => {
-      const mdPath = path.join(
-        repoRoot,
-        "packages/cli/src/templates/trae/agents",
-        `${name}.md`,
-      );
-      const content = fs.readFileSync(mdPath, "utf-8");
+      const content = getAllAgents().find((agent) => agent.name === name)?.content;
       // Hard prohibition keyword
       expect(content).toMatch(/Do NOT spawn/i);
       // Mentions both sibling agent kinds explicitly

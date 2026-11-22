@@ -103,6 +103,22 @@ export {
 } from "./internal/store/delivery.js";
 
 export type { ChannelEventFilter } from "./internal/store/filter.js";
+export {
+  assertSafeName,
+  channelDir,
+  channelRoot,
+  currentProjectKey,
+  eventsPath,
+  isSafeName,
+  listProjects,
+  migrateLegacyChannels,
+  projectDir,
+  projectKey,
+  workerFile,
+  workerLockPath,
+} from "./internal/store/paths.js";
+export { withLock } from "./internal/store/lock.js";
+export { watchEvents } from "./internal/store/watch.js";
 export type { WatchFilter } from "./internal/store/watch.js";
 
 export {

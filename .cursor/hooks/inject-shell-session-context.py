@@ -23,15 +23,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-# Hook hosts send UTF-8 JSON regardless of the process locale.
-_stdin_reconfigure = getattr(sys.stdin, "reconfigure", None)
-if callable(_stdin_reconfigure):
-    try:
-        _stdin_reconfigure(encoding="utf-8", errors="replace")
-    except (OSError, ValueError):
-        pass
-
-
 DIR_WORKFLOW = ".trellis"
 DIR_RUNTIME = ".runtime"
 DIR_SHELL_TICKETS = "shell-tickets"
@@ -90,20 +81,15 @@ def _resolve_trellis_root(hook_input: dict[str, Any]) -> Path | None:
         pass
 
     for candidate in candidates:
-        root = _find_trellis_root(candidate)
-        if root is not None:
-            return root
+        current = candidate.resolve()
+        for directory in (current, *current.parents):
+            if (directory / DIR_WORKFLOW).is_dir():
+                return directory
+            if (directory / ".git").exists():
+                # The payload identifies a checkout, so the process cwd must
+                # not supply a different checkout's session ticket.
+                return None
     return None
-
-
-def _find_trellis_root(start: Path) -> Path | None:
-    current = start.resolve()
-    while True:
-        if (current / DIR_WORKFLOW).is_dir():
-            return current
-        if current == current.parent:
-            return None
-        current = current.parent
 
 
 def _runtime_ticket_dir(root: Path) -> Path:
@@ -253,12 +239,10 @@ def main() -> int:
     if os.environ.get("TRELLIS_HOOKS") == "0" or os.environ.get("TRELLIS_DISABLE_HOOKS") == "1":
         return 0
 
-    try:
-        hook_input = json.loads(sys.stdin.read())
-    except (json.JSONDecodeError, ValueError):
-        hook_input = {}
-    if not isinstance(hook_input, dict):
-        hook_input = {}
+    # Project ownership is still unknown; importing the reader must be read-only.
+    sys.dont_write_bytecode = True
+    from trellis_hook_io import load_hook_input
+    hook_input = load_hook_input()
 
     command, response = _pending_shell_command(hook_input)
     subcommands = _extract_task_subcommands(command)
@@ -266,7 +250,7 @@ def main() -> int:
         return 0
 
     root = _resolve_trellis_root(hook_input)
-    if root is None:
+    if root is None or not (root / DIR_WORKFLOW / "scripts" / "common").is_dir():
         return 0
 
     if not _has_context_identity(hook_input):
@@ -289,4 +273,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Trellis hook skipped ({type(exc).__name__}).", file=sys.stderr)

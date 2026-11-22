@@ -6,8 +6,41 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   assertSafeManagedPath,
   buildManagedRemovalPlan,
+  buildStructuredFileSpecs,
   validateManagedRelativePath,
 } from "../../src/utils/managed-removal.js";
+
+import {
+  collectPlatformTemplates,
+  PLATFORM_IDS,
+} from "../../src/configurators/index.js";
+
+it("registers every installed shared JSON and leaves dedicated Trellis resources opaque", () => {
+  const ownedResources = new Set([
+    ".kiro/agents/trellis.json",
+    ".kiro/agents/trellis-check.json",
+    ".kiro/agents/trellis-implement.json",
+    ".kiro/agents/trellis-research.json",
+    ".github/hooks/trellis.json",
+    ".snow/commands/trellis-continue.json",
+    ".snow/commands/trellis-finish-work.json",
+  ]);
+  const installed = new Set(
+    PLATFORM_IDS.flatMap((platform) =>
+      [...(collectPlatformTemplates(platform)?.keys() ?? [])].filter((file) =>
+        file.endsWith(".json"),
+      ),
+    ),
+  );
+  const registered = [...buildStructuredFileSpecs().keys()].filter((file) =>
+    file.endsWith(".json"),
+  );
+  expect(new Set(registered)).toEqual(
+    new Set([...installed].filter((file) => !ownedResources.has(file))),
+  );
+  for (const path of ownedResources)
+    expect(installed.has(path), path).toBe(true);
+});
 
 describe("managed-removal strict planning", () => {
   let tmpDir: string;

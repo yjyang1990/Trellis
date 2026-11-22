@@ -12,6 +12,7 @@ import {
 } from "../../src/configurators/index.js";
 
 const ALL_HOOK_FILES = [
+  "trellis_hook_io.py",
   "session-start.py",
   "inject-shell-session-context.py",
   "inject-workflow-state.py",
@@ -37,8 +38,11 @@ describe("shared-hooks capability table", () => {
 
   it("every shared-hook file is distributed to at least one platform", () => {
     const distributed = new Set<string>();
-    for (const hooks of Object.values(SHARED_HOOKS_BY_PLATFORM)) {
-      for (const h of hooks) distributed.add(h);
+    for (const platform of Object.keys(
+      SHARED_HOOKS_BY_PLATFORM,
+    ) as SharedHookPlatform[]) {
+      for (const h of getSharedHookScriptsForPlatform(platform))
+        distributed.add(h.name);
     }
     for (const hook of getSharedHookScripts()) {
       expect(
@@ -184,14 +188,17 @@ describe("shared-hooks capability table", () => {
     );
   });
 
-  it("getSharedHookScriptsForPlatform returns exactly the declared set per platform", () => {
+  it("getSharedHookScriptsForPlatform returns the declared entry points and their input reader per platform", () => {
     for (const platform of Object.keys(
       SHARED_HOOKS_BY_PLATFORM,
     ) as SharedHookPlatform[]) {
       const names = getSharedHookScriptsForPlatform(platform)
         .map((h) => h.name)
         .sort();
-      const expected = [...SHARED_HOOKS_BY_PLATFORM[platform]].sort();
+      const expected = [
+        ...SHARED_HOOKS_BY_PLATFORM[platform],
+        "trellis_hook_io.py",
+      ].sort();
       expect(names).toEqual(expected);
     }
   });

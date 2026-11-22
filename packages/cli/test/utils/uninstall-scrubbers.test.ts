@@ -7,6 +7,7 @@
  *  - Reports `fullyEmpty: true` when nothing meaningful remains
  */
 
+import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
 import {
   scrubHooksJson,
@@ -16,6 +17,10 @@ import {
   scrubManagedMarkdownBlock,
 } from "../../src/utils/uninstall-scrubbers.js";
 import { getConfigTemplate as getCodexConfigTemplate } from "../../src/templates/codex/index.js";
+
+import { computeHash } from "../../src/utils/template-hash.js";
+import { buildStructuredFileSpecs } from "../../src/utils/managed-removal.js";
+import { collectPlatformTemplates } from "../../src/configurators/index.js";
 
 const CLAUDE_DELETE_PATHS = [
   ".claude/hooks/session-start.py",
@@ -604,5 +609,217 @@ project_doc_fallback_filenames = ["AGENTS.md"]
     const { content, fullyEmpty } = scrubCodexConfigToml(newTemplate);
     expect(fullyEmpty).toBe(true);
     expect(content.trim()).toBe("");
+  });
+});
+
+describe("manifest-backed platform event hooks", () => {
+  const registry = buildStructuredFileSpecs();
+  for (const platform of ["snow", "zcode"] as const) {
+    const templates =
+      collectPlatformTemplates(platform) ?? new Map<string, string>();
+    for (const [path, pristine] of templates) {
+      const spec = registry.get(path);
+      if (!spec || !path.endsWith(".json")) continue;
+      const paths = [...templates.keys()];
+      it(`keeps ${path} byte-identical without evidence of a managed entry`, () => {
+        for (const content of [
+          "",
+          "{invalid",
+          "[]",
+          "null",
+          "{}",
+          '{ "hooks": { "events": [] } }',
+          '{"onSessionStart":[null,{"hooks":[]}]}',
+        ]) {
+          expect(spec.scrub(content, paths)).toEqual({
+            content,
+            fullyEmpty: false,
+          });
+        }
+        expect(spec.scrub(pristine, [path])).toEqual({
+          content: pristine,
+          fullyEmpty: false,
+        });
+      });
+      it(`preserves lookalike commands and unknown data in ${path}`, () => {
+        const root = JSON.parse(pristine);
+        const events = platform === "zcode" ? root.hooks.events : root;
+        const event = Object.keys(events)[0];
+        const group = events[event][0];
+        const entry = group.hooks[0];
+        const neighbors = [
+          null,
+          {},
+          { ...entry, type: "future-type" },
+          { ...entry, userField: "keep" },
+          { ...entry, timeout: { custom: true } },
+          { ...entry, command: "echo " + entry.command },
+          { ...entry, command: entry.command + " --custom" },
+          {
+            ...entry,
+            command: entry.command
+              .replace(/ (session|user|subagent)$/, " another-mode")
+              .replace(".zcode/", "other/.zcode/"),
+          },
+        ];
+        group.hooks.push(...neighbors);
+        events[event].push(
+          {
+            ...group,
+            hooks: [entry],
+            matcher: "user-matcher",
+            userMetadata: 1,
+          },
+          { hooks: [] },
+        );
+        events.unrecognized = [entry];
+        const result = spec.scrub(
+          JSON.stringify(root),
+          paths,
+          computeHash(pristine),
+        );
+        expect(result.fullyEmpty).toBe(false);
+        const after = JSON.parse(result.content);
+        const remaining = platform === "zcode" ? after.hooks.events : after;
+        expect(remaining[event]).toEqual([
+          { ...group, hooks: neighbors },
+          {
+            ...group,
+            hooks: [entry],
+            matcher: "user-matcher",
+            userMetadata: 1,
+          },
+          { hooks: [] },
+        ]);
+        expect(remaining.unrecognized).toEqual([entry]);
+        expect(
+          spec.scrub(result.content, paths, computeHash(pristine)),
+        ).toEqual(result);
+      });
+    }
+  }
+
+  it.each([
+    "alternate launcher",
+    "different matcher",
+    "identical duplicates",
+  ] as const)("preserves a ZCode user registration with %s", (kind) => {
+    const path = ".zcode/config.json";
+    const templates = collectPlatformTemplates("zcode");
+    const pristine = templates?.get(path);
+    const spec = registry.get(path);
+    if (!templates || !pristine || !spec)
+      throw new Error("Missing ZCode templates or scrubber");
+    const paths = [...templates.keys()];
+    const hash = computeHash(pristine);
+    const config = JSON.parse(pristine);
+    const [agentGroup, bashGroup] = config.hooks.events.PreToolUse;
+    const owned = bashGroup.hooks[0];
+    const user = { ...owned };
+    const group = kind === "different matcher" ? agentGroup : bashGroup;
+    if (kind === "alternate launcher") {
+      user.command = owned.command.replace(
+        /^.+? /,
+        owned.command.startsWith("python ") ? "python3 " : "python ",
+      );
+    }
+    group.hooks.push(user);
+    const result = spec.scrub(JSON.stringify(config), paths, hash);
+    expect(result.fullyEmpty).toBe(false);
+    const remaining = JSON.parse(result.content).hooks.events;
+    expect(remaining).toEqual({
+      PreToolUse: [
+        {
+          ...group,
+          hooks: kind === "identical duplicates" ? [owned, user] : [user],
+        },
+      ],
+    });
+    expect(spec.scrub(result.content, paths, hash)).toEqual(result);
+  });
+
+  it("uses the recorded pre-shell-hook ZCode template to distinguish launchers", () => {
+    const path = ".zcode/config.json";
+    const spec = registry.get(path);
+    const templates = collectPlatformTemplates("zcode");
+    if (!spec || !templates)
+      throw new Error("Missing ZCode templates or scrubber");
+    const pristine = readFileSync(
+      new URL(
+        "../../src/templates/zcode/config-before-shell-hook.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ).replaceAll("{{PYTHON_CMD}}", "python3");
+    const paths = [...templates.keys()];
+    const hash = computeHash(pristine);
+    expect(spec.scrub(pristine, paths, hash).fullyEmpty).toBe(true);
+    const config = JSON.parse(pristine);
+    const group = config.hooks.events.SessionStart[0];
+    const owned = group.hooks[0];
+    const user = {
+      ...owned,
+      command: owned.command.replace("python3 ", "python "),
+    };
+    group.hooks.push(user);
+    expect(
+      JSON.parse(spec.scrub(JSON.stringify(config), paths, hash).content).hooks
+        .events,
+    ).toEqual({ SessionStart: [{ ...group, hooks: [user] }] });
+  });
+
+  it("recognizes a custom ZCode launcher only with its installation hash", () => {
+    const path = ".zcode/config.json";
+    const templates = collectPlatformTemplates("zcode");
+    const spec = registry.get(path);
+    if (!templates || !spec)
+      throw new Error("Missing ZCode templates or scrubber");
+    const pristine = (templates.get(path) ?? "").replace(
+      /(?:python3?|py -3) /g,
+      "py -3.12 ",
+    );
+    const installedHash = computeHash(pristine);
+    const paths = [...templates.keys()];
+    expect(spec.scrub(pristine, paths, installedHash).fullyEmpty).toBe(true);
+    const config = JSON.parse(pristine);
+    const group = config.hooks.events.SessionStart[0];
+    const entry = group.hooks[0];
+    const lookalike = {
+      ...entry,
+      command: entry.command.replace("py -3.12", "echo"),
+    };
+    group.hooks.push(lookalike);
+    const mixed = JSON.stringify(config);
+    expect(spec.scrub(mixed, paths).content).toBe(mixed);
+    expect(
+      JSON.parse(spec.scrub(mixed, paths, installedHash).content).hooks.events,
+    ).toEqual({
+      SessionStart: [{ ...group, hooks: [lookalike] }],
+    });
+  });
+
+  it("preserves a user-disabled ZCode wrapper with all probed Python launchers", () => {
+    const path = ".zcode/config.json";
+    const templates = collectPlatformTemplates("zcode");
+    const spec = registry.get(path);
+    if (!templates || !spec)
+      throw new Error("Missing ZCode templates or scrubber");
+    for (const launcher of ["python", "python3", "py -3"]) {
+      const pristine = (templates.get(path) ?? "").replace(
+        /(?:python3?|py -3) /g,
+        `${launcher} `,
+      );
+      const root = JSON.parse(pristine);
+      root.hooks.enabled = false;
+      expect(
+        JSON.parse(
+          spec.scrub(
+            JSON.stringify(root),
+            [...templates.keys()],
+            computeHash(pristine),
+          ).content,
+        ),
+      ).toEqual({ hooks: { enabled: false } });
+    }
   });
 });

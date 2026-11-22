@@ -6,6 +6,7 @@ Single source of truth for running git commands across all Trellis scripts.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -43,6 +44,8 @@ def run_git(
         result = subprocess.run(
             git_args,
             cwd=cwd,
+            # Auto-commit distinguishes ignored paths from other git add failures.
+            env={**os.environ, "LC_ALL": "C"} if args[:1] == ["add"] else None,
             capture_output=True,
             text=True,
             encoding="utf-8",

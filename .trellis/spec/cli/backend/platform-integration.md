@@ -348,13 +348,11 @@ built-binary `trellis init` -> `.trellis/.template-hashes.json` -> built-binary
 
 ### Step 6: Python Scripts (independent runtime)
 
-> **Warning**: `cli_adapter.py` uses if/elif/else chains with NO exhaustive check. New platforms silently fall through to the `else` branch (Claude defaults). You MUST add explicit branches for **every method** listed below.
+`task.py create` detects platforms independently of `cli_adapter.py`. Update the task-context marker and verify the generated task as described below.
 
-| File                                                  | Change                                                                                                          |
-| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `src/templates/trellis/scripts/common/cli_adapter.py` | Add to `Platform` literal type, `config_dir_name` property, `detect_platform()`, `get_cli_adapter()` validation |
+`common/cli_adapter.py` ships as a compatibility API for Python callers. Its `Platform` literal and `get_cli_adapter()` define the accepted identifiers. They still include `iflow`, and the factory accepts `windsurf` as an alias for `devin`. ZCode, Snow, DSH and Reasonix have native Trellis integrations outside this adapter. The repository packages the module and exercises it in regression tests. External scripts may also import it.
 
-**cli_adapter.py methods requiring explicit branches** (do NOT rely on `else` fallthrough):
+Extend the adapter when a caller needs a verified platform operation. In that case, review the factory, detection, and methods below. Implement launch and resume arguments only when the host CLI supports them, and cover the operation with a behavioral test.
 
 | Method                       | What to decide                    | Example                                          |
 | ---------------------------- | --------------------------------- | ------------------------------------------------ |
@@ -366,8 +364,6 @@ built-binary `trellis init` -> `.trellis/.template-hashes.json` -> built-binary
 | `cli_name`                   | CLI executable name               | `"gemini"`, `"agy"`                              |
 | `detect_platform()`          | Directory detection logic         | Check `.gemini/` exists                          |
 | `get_commands_path()`        | Command directory structure       | `commands/trellis/` or `workflows/`              |
-
-> Note: Python scripts run in user projects at runtime — they cannot import from the TS registry and maintain their own registry in `cli_adapter.py`.
 
 ### Active Task Resolution
 
@@ -505,15 +501,11 @@ Hook, statusline, or plugin output that mentions an active task should include
 the source (`session` or `session:<key>`) so cross-window mistakes are visible
 while debugging. Statuslines may shorten this to `[session]` to avoid noisy UI.
 
-**Also update `task_store.py` when adding a sub-agent-capable platform**:
+**Task context manifests**
 
-| File                                                 | Constant                        | When to update                                                                                                              |
-| ---------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `src/templates/trellis/scripts/common/task_store.py` | `_SUBAGENT_CONFIG_DIRS` (tuple) | Add `.{configDir}/` if the new platform can spawn sub-agents (Class-1 hook-inject, Class-2 pull-based, or extension-backed) |
+`task.py create` creates empty `implement.jsonl` and `check.jsonl` when a platform dispatches Trellis sub-agents. Add its installed directory marker to `_SUBAGENT_CONFIG_DIRS` in `src/templates/trellis/scripts/common/task_store.py` and sync the dogfood copy. Use the registered `configDir` for new markers. For example, Snow uses `.snow/skills` and Copilot uses `.github/copilot`. Kiro also recognizes its historical `.kiro` root.
 
-This tuple is consulted by `cmd_create` to decide whether to seed `implement.jsonl` / `check.jsonl` for the new task. Agent-less platforms (Kilo, Antigravity, Devin) MUST be excluded — they don't consume jsonl.
-
-Same root reason as `cli_adapter.py`: Python scripts run at user-project runtime and can't import from the TS `AI_TOOLS` registry, so they maintain their own parallel registry. When adding/removing sub-agent capability, update both in tandem.
+`test/registry-invariants.test.ts` runs the shipped `task.py create` for every `AI_TOOLS` entry and checks both files. Its expectations follow `templateContext.agentCapable` with two dispatch-specific rules. DSH implements Trellis tasks inline. Codex requires `.codex` and defaults to `auto`, accepts the legacy `sub-agent` alias, and skips the manifests in explicit `inline` mode. Shared `.agents/skills` alone supplies no platform identity.
 
 > **Codex-specific CLIAdapter notes:**
 >
@@ -678,7 +670,7 @@ If Trellis project itself should support the new platform:
 
 ### Step 11: Tests (MANDATORY)
 
-> **Warning**: Dynamic iteration tests (e.g., `PLATFORM_IDS.forEach`) only verify registry metadata. They do NOT cover platform-specific runtime behavior. You MUST add explicit tests.
+> **Warning**: Registry-wide tests cover task creation and template parity. Add explicit tests for platform-specific runtime behavior.
 
 | Test File                                | What to Add                                                                                                                                                                                                             |
 | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -686,7 +678,7 @@ If Trellis project itself should support the new platform:
 | `test/configurators/platforms.test.ts`   | Detection test: `getConfiguredPlatforms` recognizes tracked Trellis templates but ignores native platform directories. Content test: `configurePlatform` writes the expected paths, no compiled artifacts. **The `configure` ⟷ `collectTemplates` parity assertions are registry-wide and cover a new platform automatically — do not copy them per platform** |
 | `test/commands/init.integration.test.ts` | Init test: `init({ {platform}: true })` creates correct directory. Negative assertions: add `.{configDir}` checks to existing platform tests                                                                            |
 | `test/templates/extract.test.ts`         | `get{Platform}TemplatePath()` returns existing dir. `get{Platform}SourcePath()` deprecated alias equals template path                                                                                                   |
-| `test/regression.test.ts`                | Platform registration: `AI_TOOLS.{platform}` exists with correct `configDir`. cli_adapter: `commonCliAdapter` contains `"{platform}"` and `".{configDir}"`. Update `withTracking` list if `collectTemplates` is defined |
+| `test/regression.test.ts`                | Platform registration: `AI_TOOLS.{platform}` exists with correct `configDir`. Exercise `get_cli_adapter()` for platforms that explicitly extend the compatibility API. Update `withTracking` list if `collectTemplates` is defined |
 
 For extension-backed platforms like Pi Agent, add explicit regression coverage that no Python hook files are installed under the platform config directory and that the generated extension exposes the required sub-agent and hook-equivalent event surface.
 
@@ -829,7 +821,6 @@ Configurator output:
 Runtime script registry:
 
 ```python
-Platform = Literal[..., "pi", "zcode"]
 _SUBAGENT_CONFIG_DIRS = (..., ".pi", ".zcode")
 ```
 
@@ -852,7 +843,7 @@ The compact model-visible context injection point is `before_agent_start.message
 
 Cache-stability invariant: everything the extension contributes to `systemPrompt` must be byte-identical across every turn of a session (provider prefix caches invalidate from byte 0 on any system prompt change). Startup context and task context are therefore memoized per context key; anything volatile (workflow breadcrumb, session overview, task-doc changes) is delivered exclusively through persisted `before_agent_start.message` custom messages, and only when its content differs from the last persisted copy.
 
-If `agentCapable` is true, `task.py create` must seed `implement.jsonl` / `check.jsonl`, and generated sub-agent definitions or extension code must consume those files.
+If the extension dispatches Trellis sub-agents, `task.py create` must seed `implement.jsonl` / `check.jsonl`, and generated sub-agent definitions or extension code must consume those files.
 
 ### 4. Validation & Error Matrix
 
@@ -2167,7 +2158,7 @@ if (!hadDeveloperFileBefore) {
 
 **Symptom**: Python scripts fail with "Unsupported platform" error.
 
-**Fix**: Add platform to `Platform` literal type, `config_dir_name` property, and `get_cli_adapter()` validation in `cli_adapter.py`.
+**Fix**: Check the calling script against the compatibility API in Step 6. An extension to that API needs verified CLI operations and a regression test.
 
 ### Wrong command format in templates
 

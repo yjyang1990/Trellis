@@ -122,7 +122,7 @@ Runs the full pipeline up to and including the printed plan and breaking-change 
 Three meanings, all in this single flag:
 
 1. **Conflict resolution** (`commands/update.ts:promptConflictResolution`): for every entry in `changedFiles`, choose `overwrite` without asking.
-2. **Migration mode** (`commands/update.ts:executeMigrations`): for every `confirm`-bucket migration, treat as `rename`/`delete` (no inline `.backup`). The full snapshot under `.trellis/.backup-<timestamp>/` is the only safety net in this mode — see `update.integration.test.ts > #26 rename-anyway does NOT leave an inline .backup`.
+2. **Migration mode** (`migrations/file-migrations.ts:executeMigrations`): for every `confirm`-bucket migration, treat as `rename`/`delete` (no inline `.backup`). The full snapshot under `.trellis/.backup-<timestamp>/` is the only safety net in this mode — see `update.integration.test.ts > #26 rename-anyway does NOT leave an inline .backup`.
 3. **Final confirm** (`commands/update.ts:update`): skip the global `Proceed?` prompt. This is what makes `trellis update --force --migrate` viable for CI / scripted upgrades.
 
 ### `--skip-all` / `-s`
@@ -141,8 +141,8 @@ Permits `cliVersion < projectVersion`. Without it, `update()` exits early with a
 
 Opt-in to apply file migrations (renames/deletes/dir renames). Without it: migrations are listed in the plan but not executed; a "Tip: Use --migrate" hint prints. With it:
 
-1. `commands/update.ts:executeMigrations` runs on the classified plan.
-2. The hardcoded 0.2.0 `traces-*.md → journal-*.md` rename runs via `commands/update.ts:renameTracesToJournal(workspaceDir)` (workspace/<dev>/ pattern walk; cannot live in the manifest because the path includes a variable developer slug). It never overwrites: if the `journal-*.md` target already exists, that file is left as-is and reported back in a `skipped` list instead of being renamed over — `.trellis/workspace/` is outside the backup snapshot, so an overwrite there would be unrecoverable. See [Filesystem Safety § 3](./filesystem-safety.md).
+1. `migrations/file-migrations.ts:executeMigrations` runs on the classified plan.
+2. The hardcoded 0.2.0 `traces-*.md → journal-*.md` rename runs via `migrations/file-migrations.ts:renameTracesToJournal(workspaceDir)` (workspace/<dev>/ pattern walk; cannot live in the manifest because the path includes a variable developer slug). It never overwrites: if the `journal-*.md` target already exists, that file is left as-is and reported back in a `skipped` list instead of being renamed over — `.trellis/workspace/` is outside the backup snapshot, so an overwrite there would be unrecoverable. See [Filesystem Safety § 3](./filesystem-safety.md).
 
 `safe-file-delete` migrations are independent of `--migrate` — they always run when their hash gate passes (see Apply Phase). A historical deletion is ignored when its path is present in the current template snapshot: current template ownership takes precedence if a later release intentionally restores a retired path. Rationale in `migrations.md`.
 
@@ -156,9 +156,9 @@ There is no `--tag` flag on `trellis update` today. Version selection is implici
 
 ### Pending migrations
 
-`commands/update.ts:update` calls `migrations/index.ts:getMigrationsForVersion(projectVersion, cliVersion)` to get the migration set, then merges in **orphaned migrations** — items whose source still exists and target doesn't, regardless of version range. Orphans show up when a previous update bumped `.trellis/.version` but a migration was skipped or interrupted; they get added to `pendingMigrations` so the next `--migrate` cleans them up.
+`getMigrationsForVersion(projectVersion, cliVersion)` supplies the upgrade's migrations. With a known project version, update also considers incomplete renames released through the installed CLI version. A surviving source with an absent target qualifies for review. Explicit `--migrate` also revisits coexisting directory roots when an installed legacy file and its receipt establish source ownership.
 
-Migration state is then run through `commands/update.ts:classifyMigrations` against current hashes and templates:
+Migration state is then run through `migrations/file-migrations.ts:classifyMigrations` against current hashes and templates:
 
 | Class | Trigger |
 |---|---|
@@ -167,9 +167,9 @@ Migration state is then run through `commands/update.ts:classifyMigrations` agai
 | `conflict` | both source and target exist with user content |
 | `skip` | source missing, path is `PROTECTED_PATHS`, or (see below) an unowned `rename-dir` source |
 
-`rename-dir` has an extra ownership gate when the target is absent: `commands/update.ts:dirHasManifestEntries(item.from, hashes)` must find at least one manifest-tracked file under that source directory before it lands in `auto`. If the manifest has no record of the directory — e.g. a user's own `.windsurf/` editor config that merely shares a path with a retired Trellis platform dir — the item goes to `skip` instead, even under `--force` (skip never executes). See [Filesystem Safety § 2–3](./filesystem-safety.md) for the rationale and the other ownership/backup gates it's modeled after.
+`rename-dir` requires a receipt for an existing source file at a known historical installation path. The walk-managed `.trellis` roots can use an existing tracked file for a move into an absent target. When both roots exist, update keeps the destination, including target-only files. It can retire the source if every source file is tracked, unmodified, and represented by a regular current-template file in the destination, and every target file matches its receipt or the template. Untracked source files, user edits, and symlinks in either scanned tree require manual resolution. [Filesystem safety](./filesystem-safety.md)
 
-Sorting before execution is by `commands/update.ts:sortMigrationsForExecution`: deeper `rename-dir` first, then other `rename-dir`, then `rename` / `delete`. Critical for nested directory renames — without depth ordering, a parent move would leave child entries pointing at a dead source.
+Sorting before execution is by `migrations/file-migrations.ts:sortMigrationsForExecution`: deeper `rename-dir` first, then other `rename-dir`, then `rename` / `delete`. Critical for nested directory renames — without depth ordering, a parent move would leave child entries pointing at a dead source.
 
 ### The breaking-change gate
 
@@ -212,7 +212,11 @@ Order of operations in `commands/update.ts:update` (after the `Proceed?` confirm
 
 1. **Backup** — `commands/update.ts:createFullBackup` snapshots every `BACKUP_DIRS` (= `configurators/index.ts:ALL_MANAGED_DIRS`) entry plus `BACKUP_FILES` (= `AGENTS.md`) into `.trellis/.backup-<ISO-timestamp>/`. `commands/update.ts:shouldExcludeFromBackup` filters out previous backups, `node_modules/`, user-data dirs (`workspace/`, `tasks/`, `spec/`, `backlog/`, `agent-traces/`), and platform-native worktree dirs (`/worktrees/`, `/worktree/`). Symlinks (and Windows directory junctions) are never followed in `commands/update.ts:collectAllFiles` — a junction to an ancestor would loop forever.
 
-2. **Migrations** (only if `--migrate`) — `commands/update.ts:executeMigrations` runs `auto` items first (sorted by depth), then `confirm` items via `commands/update.ts:promptMigrationAction` (or `--force` / `--skip-all` short-circuits). Default action for prompts is `backup-rename`: leaves `<new-path>.backup` of the user's modified content alongside the rename, so users can diff inline without digging through the snapshot. Hash tracking is updated via `utils/template-hash.ts:renameHash` / `removeHash`. Empty source dirs are pruned by `commands/update.ts:cleanupEmptyDirs` (gated by `configurators/index.ts:isManagedPath` + `isManagedRootDir` — never deletes managed roots themselves, never crosses into unmanaged paths). After regular migrations, the hardcoded `traces-*.md → journal-*.md` workspace walk (`commands/update.ts:renameTracesToJournal`) runs; files whose journal target already exists are skipped (not overwritten) and printed as a yellow "Kept ... its journal target already exists" warning.
+2. **Migrations** (only if `--migrate`) — `migrations/file-migrations.ts:executeMigrations` runs `auto` items first (sorted by depth), then `confirm` items via `migrations/file-migrations.ts:promptMigrationAction` (or `--force` / `--skip-all` short-circuits). Default action for prompts is `backup-rename`: leaves `<new-path>.backup` of the user's modified content alongside the rename, so users can diff inline without digging through the snapshot. Hash tracking is updated via `utils/template-hash.ts:renameHash` / `removeHash`. Empty source dirs are pruned by `commands/update.ts:cleanupEmptyDirs` (gated by `configurators/index.ts:isManagedPath` + `isManagedRootDir` — never deletes managed roots themselves, never crosses into unmanaged paths). After regular migrations, the hardcoded `traces-*.md → journal-*.md` workspace walk (`migrations/file-migrations.ts:renameTracesToJournal`) runs; files whose journal target already exists are skipped (not overwritten) and printed as a yellow "Kept ... its journal target already exists" warning.
+
+   Before saving pruned hashes or taking the backup, update checks whether template paths are usable on disk and under source directories about to move into absent destinations. A file blocking a required directory, or a directory occupying a required file, stops the update with the blocking path. After resolving it, rerun the same command.
+
+   After a regular migration moves or deletes files, update reloads the receipts and reclassifies template writes and hash repairs against the new disk state. Newly discovered edits use the usual conflict policy.
 
 3. **`safe-file-delete`** — `commands/update.ts:executeSafeFileDeletes` deletes files in the `delete` action bucket (hash matched, not protected, not in `update.skip` unless bypassed), removes their hash entries, and prunes empty parent directories. `commands/update.ts:collectSafeFileDeletes` first excludes paths owned by the current template snapshot so historical cleanup cannot conflict with a reintroduced template. `migrations.md` covers the full classification matrix.
 
@@ -243,6 +247,10 @@ Order of operations in `commands/update.ts:update` (after the `Proceed?` confirm
 - `isTemplateModified(cwd, path, hashes)` in `classifyMigrations`
 - `renameHash` / `removeHash` during migrations
 - `updateHashes(cwd, files)` at the end
+
+During a direct 0.4.x upgrade, `update` checks flat receipt entries against the paths and SHA-256 digests shipped in 0.4.0. Windows path separators, CRLF digests and Windows hook commands map to their v2 equivalents. A verified private Trellis file identifies its platform. OpenCode’s generic `.opencode/package.json` receipt is imported only when another verified Trellis file identifies OpenCode. While the project version is still 0.4.x, a retry recognizes historical platform evidence in the converted v2 receipt as well. Conversion stops at symbolic links on the receipt or affected installation paths before following them. The backup retains the flat receipt, and the apply phase writes the filtered v2 receipt before executing migrations. Uninstall and ablate continue to use the v2 reader.
+
+Before deleting `.claude/hooks/ralph-loop.py` on this upgrade, update checks `.claude/settings.json`. It removes the released `SubagentStop` handler for matcher `check`, preserving sibling handlers and unrelated settings under `--skip-all` and `--create-new`. A reference in `.claude/settings.local.json`, an ambiguous reference, or invalid settings JSON stops the upgrade before the receipt or script changes.
 
 `saveHashes` (called by `updateHashes`/`renameHash`/`removeHash`) writes `.trellis/.template-hashes.json` via `writeFileAtomic` (temp file in the same dir + rename), not a direct `writeFileSync`. A crash mid-write can no longer truncate the manifest to `{}`, which would otherwise make every managed file look user-modified on the next run. See [Filesystem Safety § 1](./filesystem-safety.md).
 
@@ -291,7 +299,7 @@ This document does NOT restate any of that. When extending update behavior, deci
 
 - New manifest field → `migrations.md`, plus the consumer wiring in `update.ts`.
 - New CLI flag, new interactive prompt, new write phase, new banner → here.
-- New migration *type* → both: define the type and classification in `migrations.md`, define the executor in `update.ts:executeMigrations`.
+- New migration *type* → both: define the type and classification in `migrations.md`, define the executor in `migrations/file-migrations.ts:executeMigrations`.
 
 ---
 
@@ -307,7 +315,7 @@ This document does NOT restate any of that. When extending update behavior, deci
 
 ### Orphan migrations
 
-If `.trellis/.version` says you're already on the latest CLI but a stale `from` path still exists on disk and the new `to` doesn't, that's an orphan. `update()` always scans `getAllMigrations()` for orphans regardless of version range and adds them to `pendingMigrations`. They show up under "⚠️ Detected incomplete migrations from previous updates" in the printed plan. Causes: a previous run was interrupted between `migrations` execution and `updateVersionFile`; a previous run skipped the migration via `[s]` and the user expected it to apply later; manifest authoring error (a v0.4 entry referencing a path that was already moved before v0.4 ever shipped). All three resolve the same way: `trellis update --migrate`.
+An ordinary upgrade can advance `.trellis/.version` and install target templates while leaving the legacy source in place. Run `trellis update --migrate` to reconsider the installed source under the ownership and conflict rules above. Successful cleanup removes the source receipt and directory, so subsequent runs have no migration to repeat.
 
 ### Backup bloat
 

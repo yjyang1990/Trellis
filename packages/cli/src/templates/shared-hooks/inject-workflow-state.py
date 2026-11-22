@@ -40,8 +40,6 @@ import json
 import os
 import re
 import sys
-import queue
-import threading
 from pathlib import Path
 
 # Force UTF-8 on stdin/stdout/stderr on Windows. Default codepage there is
@@ -90,6 +88,8 @@ def find_trellis_root(start: Path) -> Optional[Path]:
     while cur != cur.parent:
         if (cur / ".trellis").is_dir():
             return cur
+        if (cur / ".git").exists():
+            return None
         cur = cur.parent
     return None
 
@@ -178,14 +178,9 @@ def get_active_task(
     if active.stale:
         return task_dir.name, f"stale_{active.source_type}", active.source
 
-    task_json = task_dir / "task.json"
-    if not task_json.is_file():
-        return task_dir.name, "task_error", active.source
-    try:
-        data = json.loads(task_json.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return task_dir.name, "task_error", active.source
-    if not isinstance(data, dict):
+    from common.io import read_json_checked  # type: ignore[import-not-found]
+    data, _ = read_json_checked(task_dir / "task.json")
+    if data is None:
         return task_dir.name, "task_error", active.source
 
     task_id = data.get("id") or task_dir.name
@@ -384,51 +379,21 @@ def build_breadcrumb(
 # Entry
 # ---------------------------------------------------------------------------
 
-def _load_hook_input() -> dict:
-    """Read hook JSON without trusting host runners to close stdin.
-
-    Kiro IDE `runCommand` and similar hook runners can leave stdin open while
-    sending no payload. A plain `json.load(sys.stdin)` then blocks forever.
-    Normal hook runners write the complete JSON payload and close stdin, so the
-    short daemon read preserves that path while failing closed to `{}` for
-    non-piping hosts.
-    """
-    result_queue: "queue.Queue[str | Exception]" = queue.Queue(maxsize=1)
-
-    def _read() -> None:
-        try:
-            result_queue.put(sys.stdin.read())
-        except Exception as exc:
-            result_queue.put(exc)
-
-    reader = threading.Thread(target=_read, daemon=True)
-    reader.start()
-    try:
-        raw = result_queue.get(timeout=0.2)
-    except queue.Empty:
-        return {}
-
-    if isinstance(raw, Exception):
-        return {}
-    try:
-        data = json.loads(raw) if raw.strip() else {}
-    except (json.JSONDecodeError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def main() -> int:
     if os.environ.get("TRELLIS_HOOKS") == "0" or os.environ.get("TRELLIS_DISABLE_HOOKS") == "1":
         return 0
 
-    data = _load_hook_input()
+    # Project ownership is still unknown; importing the reader must be read-only.
+    sys.dont_write_bytecode = True
+    from trellis_hook_io import load_hook_input
+    data = load_hook_input()
 
     cwd_str = data.get("cwd") or os.getcwd()
     cwd = Path(cwd_str)
 
     root = find_trellis_root(cwd)
-    if root is None:
-        return 0  # not a Trellis project
+    if root is None or not (root / ".trellis" / "scripts" / "common").is_dir():
+        return 0
 
     config = _read_trellis_config(root)
     if prompt_has_skip_keyword(data.get("prompt", ""), _resolve_skip_keyword(config)):
@@ -485,4 +450,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Trellis hook skipped ({type(exc).__name__}).", file=sys.stderr)

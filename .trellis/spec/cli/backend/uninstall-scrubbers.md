@@ -16,6 +16,8 @@ Most files Trellis writes are opaque (`.py`, `.md`, `.ts`) — `trellis uninstal
 |------|----------------|
 | `.claude/settings.json` | Trellis writes the `hooks` block and may opt in its status-line command; user may have set `env`, `model`, `permissions`, `version`, or another status line |
 | `.cursor/hooks.json` | Same idea, but a flat schema |
+| `.zcode/config.json` | `hooks.events` contains groups of commands. Other settings and user hooks can share the file. |
+| `.snow/hooks/{beforeSubAgentStart,onSessionStart,onUserMessage}.json` | Each file has a top-level event key. Its groups may contain both Trellis and user hooks. |
 | `.opencode/package.json` | Trellis adds `dependencies["@opencode-ai/plugin"]`; user may have other deps |
 | `.pi/settings.json` | Trellis adds `enableSkillCommands` plus entries in `extensions`/`skills`/`prompts` arrays; user may have entries of their own |
 | `.codex/config.toml` | Trellis writes documented fallback/hook settings, template comments, and `[agents].max_depth = 1`; user may have added more TOML directives or other `[agents]` keys |
@@ -48,11 +50,12 @@ interface ScrubResult {
 }
 ```
 
-Two distinct signatures depending on whether the scrubber needs to know the uninstall delete-set:
+The registry supplies the arguments each scrubber needs.
 
 | Signature | Used by |
 |-----------|---------|
 | `(content: string, deletedPaths: readonly string[], mode: "nested" \| "flat") → ScrubResult` | `utils/uninstall-scrubbers.ts:scrubHooksJson` |
+| `(content: string, deletedPaths: readonly string[], templateContent: string, platform: "snow" \| "zcode", installedHash?: string) → ScrubResult` | `utils/uninstall-scrubbers.ts:scrubPlatformEventHooks` |
 | `(content: string) → ScrubResult` | `utils/uninstall-scrubbers.ts:scrubOpencodePackageJson`, `:scrubPiSettings`, `:scrubCodexConfigToml` |
 
 Hooks-JSON scrubbers need the delete-set because they identify Trellis hook entries by **whether the entry's command refers to a path being deleted**. The other three identify Trellis content by exact-match values that Trellis-the-configurator hard-codes.
@@ -61,9 +64,9 @@ Hooks-JSON scrubbers need the delete-set because they identify Trellis hook entr
 
 Every scrubber holds the following:
 
-- **Input may be malformed** — if `JSON.parse` (or equivalent) throws, return `{ content, fullyEmpty: false }`. The caller's outer flow then writes the file back unchanged. We never half-rewrite.
+- **Input may be malformed** — if `JSON.parse` (or equivalent) throws, return `{ content, fullyEmpty: false }`. Uninstall skips the write. We never half-rewrite.
 - **Input may have unexpected shape** — if the parsed root isn't a plain object, return `{ content, fullyEmpty: false }`. Same reasoning.
-- **Output is canonicalized** — JSON-shaped scrubbers re-`stringify` with 2-space indent and a trailing newline, even if no change was made. This is intentional; user-written hand-formatting is acceptable collateral. Callers know.
+- **Output is canonicalized** — JSON-shaped scrubbers re-`stringify` with 2-space indent and a trailing newline, when writing a change. The Snow and ZCode scrubber returns the original bytes when it finds no owned registration.
 - **No throws** — scrubbers must not propagate exceptions; surface "I couldn't scrub this" via `fullyEmpty: false` plus original `content`.
 - **No side effects** — no `fs.*`, no `console.*`, no network. Pure function.
 - **Idempotent** — running a scrubber on its own output must yield byte-identical content (modulo the JSON pretty-print canonicalization).
@@ -115,6 +118,14 @@ This rule assumes the Trellis-emitted shape:
 #### Command field fallback
 
 `utils/uninstall-scrubbers.ts:getEntryCommand` reads `command` first, then falls back to `bash`, then `powershell`. Copilot's flat schema uses dual `bash`/`powershell` fields instead of a unified `command`. Either field is enough to identify a Trellis entry; we don't require both to match because Trellis emits the same script path on both fields.
+
+### `scrubPlatformEventHooks` for ZCode and Snow
+
+The registry passes the shipped event template into the pure scrubber. A command must match a single published registration within its event and matcher and its script must appear in the installation manifest. Snow includes the `-X utf8` flag and the event-specific `session`, `user`, or `subagent` argument. ZCode includes the quoted `${ZCODE_PROJECT_DIR}` prefix and its detected Python launcher (`python`, `python3`, or `py -3`). For every launcher, including overrides such as `py -3.12`, the scrubber substitutes the launcher into the shipped template and verifies the digest against the install-time config hash. It preserves duplicate candidates in the same event and matcher because ownership is ambiguous. Entries with unrecognized commands, changed metadata, or additional fields stay in the file, even if their command refers to a script being removed.
+
+Only a group emptied by removal and matching the shipped group metadata is pruned. Empty groups supplied by the user, additional group fields, other events and settings survive. Removing the last ZCode event also removes its otherwise empty wrapper or its sole shipped `enabled: true` field. A customized flag survives. Malformed content and files with no matching registrations retain their original bytes. In strict ablate planning, an unchanged result triggers the existing refusal before any project writes.
+
+The registry contract test enumerates JSON from every platform collector. Shared JSON needs a structured removal rule. The dedicated Kiro agent definitions, Snow slash-command definitions and `.github/hooks/trellis.json` are whole-file resources.
 
 ### `utils/uninstall-scrubbers.ts:scrubOpencodePackageJson`
 
@@ -193,13 +204,13 @@ If a future Trellis version starts emitting a *new* hook script path or a differ
 
 ## Hash gate
 
-Scrubbers themselves are **not hash-gated**. Decisions about whether a file may be touched at all are upstream:
+The manifest determines which files the planner visits.
 
 - `utils/managed-removal.ts:buildManagedRemovalPlan` only considers manifest-listed files. Files outside the manifest are never seen by any scrubber.
 - The PRD policy is "全删" — uninstall removes manifest-listed files whether or not the user has modified them. There is no per-file "user-modified, skip" branch like `update.ts` has.
 - `--force` does not exist on `uninstall`; the only flags are `--yes` (skip prompt) and `--dry-run` (plan only).
 
-Hash matching DOES affect `update.ts` flows (preserve user edits, `safe-file-delete` allowlist). It does NOT affect `uninstall`. If you are adding a scrubber and reaching for a hash gate, you are probably writing migration logic in the wrong place — see `migrations.md`.
+The ZCode scrubber also uses the recorded config digest to identify the installed Python invocation in a mixed file. The registry also recognizes the original published config from before the Bash hook. If neither template reproduces the digest, the registrations survive.
 
 ---
 
@@ -244,7 +255,7 @@ Scrubbers ARE allowed to:
 
 **Symptom**: A future configurator emits `python3 .claude/hooks/session-start.py --verbose` and `commandMatchesDeletedPath` no longer matches because the trailing token is now `--verbose`, not the script path.
 
-**Mitigation**: today, all hook commands are exactly two tokens (`<python-cmd> <script-path>`). If we ever add trailing args, `commandMatchesDeletedPath` needs to scan all tokens, not just the last. Update the helper and add a regression test.
+**Mitigation**: Use the matcher for the platform’s published invocation. Snow already uses `scrubPlatformEventHooks` to recognize its trailing argument.
 
 ### Nested marker / duplicate matcher block
 
@@ -334,4 +345,4 @@ Related specs:
 - The Pi exact-string constants (`PI_TRELLIS_EXTENSION`, `PI_TRELLIS_SKILLS`, `PI_TRELLIS_PROMPTS`) duplicate values that live in the Pi configurator. A shared module exporting these would prevent drift; today they are independently hard-coded in two places.
 - `scrubCodexConfigToml` derives current comment markers from the shipped template and keeps an explicit legacy allowlist. Other exact assignments such as `[agents].max_depth = 1` still require lockstep regression coverage when template behavior changes.
 - Codex comments now have a legacy-marker compatibility layer. Other platform constants still need an "old OR new" branch and deprecation window when their first emission change lands.
-- All hooks-JSON scrubbers re-pretty-print with 2-space indent on every call, even when no change was made. This silently rewrites user formatting (e.g. tab-indented JSON). Acceptable today; flag if users complain.
+- `scrubHooksJson` re-pretty-prints with 2-space indent on every call, even when no change was made. This silently rewrites user formatting (e.g. tab-indented JSON). Acceptable today; flag if users complain.

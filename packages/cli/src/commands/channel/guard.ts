@@ -23,6 +23,12 @@ import {
   type WorkerState,
 } from "@mindfoldhq/trellis-core/channel";
 
+import {
+  beforeConfigComment,
+  configMap,
+  parseTrellisConfig,
+  type ConfigMap,
+} from "../../utils/trellis-config.js";
 import { DIR_NAMES } from "../../constants/paths.js";
 
 import {
@@ -154,8 +160,6 @@ interface ProjectGuardConfig {
 
 /**
  * Parse the `channel.worker_guard` section out of `.trellis/config.yaml`.
- * Mirrors the lightweight line-scanner used elsewhere in update.ts so we
- * don't pull in a YAML dependency just for this two-field section.
  */
 export function loadWorkerGuardConfig(
   cwd: string,
@@ -175,67 +179,47 @@ export function loadWorkerGuardConfig(
 export function parseWorkerGuardSection(
   content: string,
 ): ProjectGuardConfig | undefined {
-  const lines = content.split("\n");
-  let inChannel = false;
-  let inGuard = false;
+  const explicit = new Map<ConfigMap, Set<string>>();
+  const config = parseTrellisConfig(content, (parent, key, _line, raw) => {
+    if (
+      (key === "idle_timeout" || key === "max_live_workers") &&
+      beforeConfigComment(raw).trim()
+    ) {
+      const keys = explicit.get(parent) ?? new Set<string>();
+      keys.add(key);
+      explicit.set(parent, keys);
+    }
+  });
+  const guard = configMap(configMap(config.channel).worker_guard);
   const found: ProjectGuardConfig = {};
-  let any = false;
-
-  for (const raw of lines) {
-    const line = raw.replace(/\r$/, "");
-    const trimmed = line.trimEnd();
-    if (trimmed === "" || trimmed.trimStart().startsWith("#")) continue;
-
-    if (/^channel:\s*$/.test(trimmed)) {
-      inChannel = true;
-      inGuard = false;
-      continue;
-    }
-    if (inChannel && /^ {2}worker_guard:\s*$/.test(trimmed)) {
-      inGuard = true;
-      continue;
-    }
-    if (inGuard) {
-      const idle = trimmed.match(/^ {4}idle_timeout:\s*(.+)$/);
-      if (idle) {
-        const val = stripValue(idle[1]);
-        found.idleTimeoutMs = parseGuardDuration(val, "idle_timeout");
-        any = true;
-        continue;
-      }
-      const max = trimmed.match(/^ {4}max_live_workers:\s*(.+)$/);
-      if (max) {
-        const val = stripValue(max[1]);
-        const n = Number(val);
-        if (!Number.isInteger(n) || n < 0) {
-          throw new Error(
-            `channel.worker_guard.max_live_workers must be a non-negative integer (got '${val}')`,
-          );
-        }
-        found.maxLiveWorkers = n;
-        any = true;
-        continue;
-      }
-      // Anything else at the same indent (or shallower) ends the section.
-      if (!/^ {4}\S/.test(line)) {
-        inGuard = false;
-      }
-    }
-    if (inChannel && !/^ {2}\S/.test(line) && /^\S/.test(line)) {
-      inChannel = false;
-      inGuard = false;
-    }
+  if (typeof guard.idle_timeout === "string") {
+    found.idleTimeoutMs = parseGuardDuration(
+      guard.idle_timeout,
+      "idle_timeout",
+    );
+  } else if (
+    explicit.get(guard)?.has("idle_timeout") ||
+    Array.isArray(guard.idle_timeout)
+  ) {
+    throw new Error("channel.worker_guard.idle_timeout must be a duration");
   }
-
-  return any ? found : undefined;
-}
-
-function stripValue(s: string): string {
-  return s
-    .trim()
-    .replace(/\s*#.*$/, "")
-    .trim()
-    .replace(/^['"]|['"]$/g, "");
+  if (typeof guard.max_live_workers === "string") {
+    const n = Number(guard.max_live_workers);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error(
+        `channel.worker_guard.max_live_workers must be a non-negative integer (got '${guard.max_live_workers}')`,
+      );
+    }
+    found.maxLiveWorkers = n;
+  } else if (
+    explicit.get(guard)?.has("max_live_workers") ||
+    Array.isArray(guard.max_live_workers)
+  ) {
+    throw new Error(
+      "channel.worker_guard.max_live_workers must be a non-negative integer",
+    );
+  }
+  return Object.keys(found).length ? found : undefined;
 }
 
 function parseGuardDuration(raw: string, key: string): number {

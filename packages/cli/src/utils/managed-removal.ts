@@ -16,11 +16,17 @@ import {
   COPILOT_INSTRUCTIONS_BLOCK_START,
   COPILOT_INSTRUCTIONS_PATH,
 } from "../templates/copilot/index.js";
+import { readSnowTemplate } from "../templates/snow/index.js";
+import {
+  getConfigBeforeShellHook,
+  getHooksConfig as getZcodeConfig,
+} from "../templates/zcode/index.js";
 import {
   scrubCodexConfigToml,
   scrubHooksJson,
   scrubManagedMarkdownBlock,
   scrubOpencodePackageJson,
+  scrubPlatformEventHooks,
   scrubPiSettings,
   type ScrubResult,
 } from "./uninstall-scrubbers.js";
@@ -36,7 +42,11 @@ export interface StructuredFileSpec {
   /** Human-readable reason for the mixed-file edit. */
   reason: string;
   /** Pure scrubber for this path. */
-  scrub: (content: string, deletedPaths: readonly string[]) => ScrubResult;
+  scrub: (
+    content: string,
+    deletedPaths: readonly string[],
+    installedHash?: string,
+  ) => ScrubResult;
 }
 
 export interface PlannedDeletion {
@@ -190,6 +200,40 @@ export function buildStructuredFileSpecs(): Map<string, StructuredFileSpec> {
       }),
     ),
     {
+      posixPath: ".zcode/config.json",
+      reason: "Remove Trellis event hooks and preserve user settings",
+      scrub: (content, paths, installedHash) => {
+        const current = scrubPlatformEventHooks(
+          content,
+          paths,
+          getZcodeConfig().content,
+          "zcode",
+          installedHash,
+        );
+        if (current.content !== content || current.fullyEmpty) return current;
+        return scrubPlatformEventHooks(
+          content,
+          paths,
+          getConfigBeforeShellHook(),
+          "zcode",
+          installedHash,
+        );
+      },
+    },
+    ...["beforeSubAgentStart", "onSessionStart", "onUserMessage"].map(
+      (event): StructuredFileSpec => ({
+        posixPath: `.snow/hooks/${event}.json`,
+        reason: "Remove Trellis event hooks and preserve user hooks",
+        scrub: (content, paths) =>
+          scrubPlatformEventHooks(
+            content,
+            paths,
+            readSnowTemplate(`hooks/${event}.json`),
+            "snow",
+          ),
+      }),
+    ),
+    {
       posixPath: ".opencode/package.json",
       reason: "Remove @opencode-ai/plugin dep; preserve other deps",
       scrub: (content) => scrubOpencodePackageJson(content),
@@ -272,7 +316,7 @@ export function buildManagedRemovalPlan(
     }
 
     const content = fs.readFileSync(absPath, "utf-8");
-    const result = spec.scrub(content, allPosixPaths);
+    const result = spec.scrub(content, allPosixPaths, hashes[posixPath]);
     if (
       options.strictPaths &&
       !result.fullyEmpty &&
@@ -284,7 +328,7 @@ export function buildManagedRemovalPlan(
     }
     if (result.fullyEmpty) {
       deletions.push({ posixPath, absPath, missing: false });
-    } else {
+    } else if (result.content !== content) {
       modifications.push({
         posixPath,
         absPath,

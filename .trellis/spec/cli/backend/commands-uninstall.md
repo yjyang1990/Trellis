@@ -65,7 +65,8 @@ For every POSIX path in `hashes`:
 4. **Spec match, file missing on disk** → record as `PlannedDeletion { missing: true }`. The scrubber is not invoked.
 5. **Spec match, file present** → read the file, run the scrubber:
    - If the scrubber returns `fullyEmpty: true`, record as `PlannedDeletion { missing: false }`. The file will be unlinked just like any other manifest entry.
-   - Otherwise, record as `PlannedModification` carrying the pre-computed `ScrubResult` (the post-scrub content) plus the `reason` string for the human-readable plan output.
+   - If the content changed, record a `PlannedModification` with its `ScrubResult` and the reason shown in the preview.
+   - If the scrubber returned the original content, leave the file off the uninstall plan to preserve its bytes. Strict ablate planning refuses that case.
 
 `removeTrellisDir` is set to `true` unconditionally — by the time
 `buildManagedRemovalPlan` runs, we have already verified `.trellis/` exists.
@@ -89,6 +90,8 @@ A `Map<posixPath, StructuredFileSpec>` built once per command invocation. Each e
 | `.codex/hooks.json` | `scrubHooksJson` | `nested` |
 | `.cursor/hooks.json` | `scrubHooksJson` | `flat` |
 | `.github/copilot/hooks.json` | `scrubHooksJson` | `flat` |
+| `.zcode/config.json` | `scrubPlatformEventHooks` | `hooks.events` |
+| `.snow/hooks/{beforeSubAgentStart,onSessionStart,onUserMessage}.json` | `scrubPlatformEventHooks` | top-level event key |
 | `.opencode/package.json` | `scrubOpencodePackageJson` | n/a |
 | `.pi/settings.json` | `scrubPiSettings` | n/a |
 | `.codex/config.toml` | `scrubCodexConfigToml` | n/a |

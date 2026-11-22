@@ -22,8 +22,15 @@
  * because those may be customized for the Trellis project itself.
  */
 
-import { cpSync, readdirSync, statSync, mkdirSync } from "node:fs";
-import { join, extname } from "node:path";
+import {
+  cpSync,
+  readdirSync,
+  statSync,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, join, extname } from "node:path";
+import { readAgentTemplate } from "../src/templates/read-agent-template.js";
 
 const EXCLUDED_TEMPLATE_ENTRIES = new Set(["__pycache__", ".DS_Store"]);
 const EXCLUDED_TEMPLATE_EXTENSIONS = new Set([".pyc", ".pyo", ".ts"]);
@@ -58,6 +65,11 @@ function copyDir(src, dest) {
 
     if (stat.isDirectory()) {
       copyDir(srcPath, destPath);
+    } else if (
+      ["agents", "droids"].includes(basename(src)) &&
+      entry.endsWith(".md")
+    ) {
+      writeFileSync(destPath, readAgentTemplate(srcPath));
     } else {
       cpSync(srcPath, destPath);
     }
@@ -68,8 +80,9 @@ function copyDir(src, dest) {
 copyDir("src/templates", "dist/templates");
 console.log("Copied src/templates/ to dist/templates/");
 
-// Copy src/migrations/manifests to dist/migrations/manifests
+// Ship the same reader that validates the source manifests before a build.
 copyDir("src/migrations/manifests", "dist/migrations/manifests");
+cpSync("src/migrations/read-manifest.js", "dist/migrations/read-manifest.js");
 console.log("Copied src/migrations/manifests/ to dist/migrations/manifests/");
 
 console.log("Template copy complete.");

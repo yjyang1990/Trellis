@@ -14,6 +14,7 @@ import type {
   MigrationItem,
   MigrationManifest,
 } from "../types/migration.js";
+import { readMigrationManifest } from "./read-manifest.js";
 import { compareVersions } from "../utils/compare-versions.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,37 +33,24 @@ function loadManifests(): Record<string, MigrationManifest> {
     return manifestCache;
   }
 
-  const manifests: Record<string, MigrationManifest> = {};
-
-  // Check if manifests directory exists
-  if (!fs.existsSync(MANIFESTS_DIR)) {
-    manifestCache = manifests;
-    return manifests;
-  }
-
-  // Load all JSON files from manifests directory
-  const files = fs
-    .readdirSync(MANIFESTS_DIR)
-    .filter((f) => f.endsWith(".json"));
-
-  for (const file of files) {
-    try {
-      const filePath = path.join(MANIFESTS_DIR, file);
-      const content = fs.readFileSync(filePath, "utf-8");
-      const manifest = JSON.parse(content) as MigrationManifest;
-
-      // Use version from manifest as key
-      if (manifest.version) {
-        manifests[manifest.version] = manifest;
-      }
-    } catch {
-      // Skip invalid manifest files
-      console.warn(`Warning: Failed to load migration manifest ${file}`);
+  const manifests: Record<string, MigrationManifest> = Object.create(null);
+  for (const file of fs.readdirSync(MANIFESTS_DIR)) {
+    if (file.endsWith(".json")) {
+      const manifest = readMigrationManifest(path.join(MANIFESTS_DIR, file));
+      manifests[manifest.version] = manifest;
     }
   }
 
   manifestCache = manifests;
   return manifests;
+}
+
+export function requireMigrationManifest(version: string): void {
+  if (!Object.hasOwn(loadManifests(), version)) {
+    throw new Error(
+      `Missing migration manifest: ${path.join(MANIFESTS_DIR, `${version}.json`)}`,
+    );
+  }
 }
 
 /**

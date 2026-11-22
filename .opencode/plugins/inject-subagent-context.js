@@ -204,7 +204,7 @@ function getResearchContext(ctx) {
 - Spec files: \`.trellis/spec/**/*.md\`
 - Known issues: \`.trellis/big-question/\`
 - Code search: Use Glob and Grep tools
-- Tech solutions: Use mcp__exa__web_search_exa or mcp__exa__get_code_context_exa`)
+- External research: Use available web or documentation search tools as needed.`)
 
   return parts.join("\n\n")
 }
@@ -316,7 +316,7 @@ You are the Research Agent in the Multi-Agent Pipeline.
 
 ## Core Principle
 
-**You do one thing: find and explain information.**
+**You do one thing: find, explain, and persist information.**
 
 ## Project Info
 
@@ -335,13 +335,15 @@ ${originalPrompt}
 1. **Understand query** - Determine search type and scope
 2. **Plan search** - List search steps
 3. **Execute search** - Run multiple searches in parallel
-4. **Organize results** - Output structured report
+4. **Organize results** - Save each topic in the current task’s research directory
 
 ## Strict Boundaries
 
-**Only allowed**: Describe what exists, where it is, how it works
+Resolve the active task with \`task.py current --source\`. If there is no active task, ask where to save the findings.
 
-**Forbidden**: Suggest improvements, criticize implementation, modify files`
+Create the current task’s \`research/\` directory if needed. Write findings only to \`{TASK_DIR}/research/*.md\`. All other files are read-only.
+
+Return each file path and a one-line summary to the caller.`
   }
 
   return templates[agentType] || originalPrompt

@@ -27,6 +27,8 @@ All workflow scripts target **Python 3.9+** for cross-platform compatibility (ma
 │   ├── active_task.py    # Session-scoped active task resolver
 │   ├── task_utils.py     # resolve_task_dir(), is_within_tasks_dir(), run_task_hooks()
 │   ├── task_store.py     # Task CRUD (create, archive, set-branch, etc.)
+│   ├── task_store_helpers.py # Path lookup and diagnostics shared with rename
+│   ├── task_rename.py    # Task rename validation, preview and execution
 │   ├── task_context.py   # JSONL context management (add-context, validate, list-context)
 │   ├── task_queue.py     # Task queue CRUD
 │   ├── config.py         # Config reader (config.yaml, hooks)

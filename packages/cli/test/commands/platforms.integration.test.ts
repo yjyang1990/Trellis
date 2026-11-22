@@ -15,6 +15,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { VERSION } from "../../src/constants/version.js";
+
 const CLI_BIN = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../bin/trellis.js",
@@ -76,6 +78,24 @@ describe("trellis platforms (#396)", () => {
       displayName: "Claude Code",
       configDir: ".claude",
     });
+  });
+
+  it("sends update notices only to stderr for human-readable commands", () => {
+    writeTrackedPlatforms(tmpDir, []);
+    fs.writeFileSync(path.join(tmpDir, ".trellis", ".version"), "0.0.1");
+
+    const json = runCli(tmpDir, ["platforms", "--json"]);
+    expect(json.status).toBe(0);
+    expect(JSON.parse(json.stdout)).toEqual({ platforms: [] });
+    expect(json.stderr).toBe("");
+
+    const version = runCli(tmpDir, ["--version"]);
+    expect(version.stdout).toBe(`${VERSION}\n`);
+    expect(version.stderr).toBe("");
+
+    const human = runCli(tmpDir, ["platforms"]);
+    expect(human.stdout).not.toContain("update available");
+    expect(human.stderr).toContain("Trellis update available");
   });
 
   it("--json reports an empty list when no platform is configured", () => {

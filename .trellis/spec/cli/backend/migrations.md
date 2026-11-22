@@ -91,11 +91,9 @@ src/migrations/
 ```
 
 **特点**：
-- 整个目录移动（包括用户添加的文件）
-- 自动批量更新 hash 追踪
-- 移动后自动清理空的源目录
-- 嵌套目录按深度优先处理（避免父目录先移动导致子目录找不到）
-- 目标目录不存在时，是否自动执行取决于归属：只有当 manifest 记录了 `from` 目录下的文件（即这个目录是 trellis 自己建的）才会 `auto`；否则视为可能是用户自建的同名目录（例如真实的 `.windsurf/` 编辑器配置），路由到 `skip`（即使 `--force` 也不执行）。详见下方分类逻辑与 [Filesystem Safety](./filesystem-safety.md)。
+- 目标缺失时，确认源目录有实际存在的受管文件后，移动整个目录（包括用户添加的文件），并转移哈希记录。
+- 两个目录都存在时保留目标。只有源文件全部为未修改的已安装模板、在目标中都有对应的当前模板文件，且目标只含模板或未修改的受管内容，才清理冗余源目录及其记录。遇到用户修改、自建文件或符号链接时保留目录，提示手动解决。
+- 嵌套目录按深度优先处理。归属检查与备份规则见 [Filesystem Safety](./filesystem-safety.md)。
 
 ### safe-file-delete 示例
 
@@ -128,10 +126,10 @@ src/migrations/
 
 | 分类 | 条件 | 行为 |
 |------|------|------|
-| `auto` | 文件未被用户修改 / rename-dir 目标不存在且源目录有 manifest 记录（trellis 建的）/ rename-dir 目标存在且只含未修改模板文件 | 自动迁移 |
+| `auto` | 文件未被用户修改 / rename-dir 可无损移动至空闲路径，或已验证源目录为可清理的冗余副本 | 自动迁移 |
 | `confirm` | 文件已被用户修改 | 默认询问，`-f` 强制，`-s` 跳过 |
-| `conflict` | 新旧路径都存在且新路径含用户修改内容 | 跳过并提示手动解决 |
-| `skip` | 旧路径不存在 / 路径受保护 / rename-dir 目标不存在且源目录无 manifest 记录（疑似用户自建同名目录，即使 `--force` 也不执行） | 无需操作 |
+| `conflict` | 新旧路径都存在且迁移无法安全保留用户内容 | 跳过并提示手动解决 |
+| `skip` | 旧路径不存在 / 路径受保护 / rename-dir 缺少源目录的安装归属证据 | 无需操作 |
 
 ## `configSectionsAdded`（追加式 config.yaml 节）
 
@@ -240,7 +238,7 @@ Existing users may have poisoned manifests from older trellis versions. `pruneOr
 3. Path appears in `from` or `to` of ANY migration manifest entry (across all `migrations/manifests/*.json`, not just pending) — must preserve so rename/delete migration logic still has a hash to compare against
 4. Path is `AGENTS.md` AND the file on disk contains `TRELLIS_BLOCK_START` + `TRELLIS_BLOCK_END` markers, OR the file is missing. Files lacking markers are treated as user-owned and pruned.
 
-`options.persist: false` for dry-run paths (e.g. `uninstall --dry-run`).
+For update, a bundled `rename-dir` can also retain an existing receipt whose exact source filename is in `migrations/legacy-directory-files.ts`. This list records files shipped at retired locations, including the Pi 0.6.7 private skill set. A directory prefix alone cannot retain an entry. Update and uninstall previews use `persist: false` to keep manifest bytes intact.
 
 #### Wrong vs Correct
 

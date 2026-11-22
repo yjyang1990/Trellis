@@ -67,15 +67,21 @@ Both regexes MUST use the `\1` backreference variant — `[workflow-state:([A-Za
 ## Runtime contract
 
 1. On every UserPromptSubmit (or platform equivalent — see hook reachability
-   matrix below), the hook receives stdin JSON containing `cwd`.
-2. It walks up from `cwd` to find `.trellis/`. If none, exit 0.
+   matrix below), the hook receives stdin JSON containing `cwd`. The shared
+   `trellis_hook_io.py` reader waits for EOF or a 0.2-second idle interval, then
+   parses all bytes received as one UTF-8 JSON object. Empty, malformed,
+   partial, or concatenated inputs produce no tool permission response.
+2. It walks up from `cwd` to find `.trellis/`, stopping at the nearest Git
+   directory or worktree marker. A missing project or missing
+   `.trellis/scripts/common` causes a silent exit 0.
 3. It calls `common.active_task.resolve_active_task()` to look up the
    per-session active task. If absent → status is the pseudo `no_task`. If
    the pointer is stale (task dir deleted) → status is `stale_<source_type>`.
 4. Otherwise it reads `task.json.status` from the resolved task directory. If
    the task directory exists but `task.json` is missing, malformed, or has no
    usable status, the hook emits the `task_error` pseudo-status and keeps the
-   task directory name in the breadcrumb header.
+   task directory name in the breadcrumb header. This includes non-UTF-8 files
+   and non-object JSON, checked through `common.io.read_json_checked`.
 5. It opens `.trellis/workflow.md` and parses every `[workflow-state:STATUS]`
    block.
 6. Codex may map `planning` / `in_progress` to `planning-inline` /

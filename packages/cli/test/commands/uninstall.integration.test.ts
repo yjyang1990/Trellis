@@ -19,7 +19,8 @@ vi.mock("inquirer", () => ({
   default: { prompt: vi.fn() },
 }));
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   execSync: vi.fn().mockImplementation((cmd: string) => {
     const py = process.platform === "win32" ? "python" : "python3";
     return cmd === `${py} --version` ? "Python 3.11.12" : "";
@@ -125,6 +126,26 @@ describe("uninstall() integration", () => {
         // The deleted file should not be referenced any more.
         expect(text).not.toContain(otherPath);
       }
+    }
+  });
+
+  it("preserves the exact bytes of an unrecognized UTF-16LE configuration", async () => {
+    await init({ yes: true, zcode: true, force: true });
+    const file = path.join(tmpDir, ".zcode/config.json");
+    const original = Buffer.from('\uFEFF{"model":"mine"}', "utf16le");
+    fs.writeFileSync(file, original);
+    await uninstall({ yes: true });
+    expect(fs.readFileSync(file)).toEqual(original);
+  });
+
+  it("removes a pristine ZCode and Snow installation", async () => {
+    await init({ yes: true, zcode: true, snow: true, force: true });
+    for (const dir of [".zcode", ".snow"]) {
+      expect(fs.existsSync(path.join(tmpDir, dir))).toBe(true);
+    }
+    await uninstall({ yes: true });
+    for (const dir of [".zcode", ".snow"]) {
+      expect(fs.existsSync(path.join(tmpDir, dir))).toBe(false);
     }
   });
 

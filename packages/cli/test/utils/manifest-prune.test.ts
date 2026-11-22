@@ -130,6 +130,20 @@ describe("pruneOrphanManifestKeys", () => {
     expect(loadHashes(tmpDir)).toHaveProperty(".trellis/workflow.md");
   });
 
+  it("retains only explicitly identified historical source files for update", () => {
+    const agent = ".zcode/cli/agents/trellis-check.md";
+    const hashes = {
+      [agent]: "installed",
+      ".zcode/cli/agents/trellis-research.md": "poisoned",
+      ".zcode/cli/agents-local/trellis-check.md": "poisoned",
+    };
+    const result = pruneOrphanManifestKeys(tmpDir, [], hashes, {
+      legacySourceFiles: new Set([agent]),
+    });
+    expect(result.hashes).toEqual({ [agent]: "installed" });
+    expect(pruneOrphanManifestKeys(tmpDir, [], hashes).hashes).toEqual({});
+  });
+
   it("does NOT write disk when persist=false", () => {
     const hashes = {
       ".trellis/workflow.md": "h1",

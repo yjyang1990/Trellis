@@ -166,7 +166,7 @@ export function getSharedHookScripts(): HookScript[] {
 }
 
 /**
- * Get the shared hook scripts that a given platform actually registers.
+ * Get the registered hooks and the input reader installed beside them.
  * Drives `collectSharedHooks` so distribution never drifts from the
  * per-platform capability declared above.
  */
@@ -174,5 +174,6 @@ export function getSharedHookScriptsForPlatform(
   platform: SharedHookPlatform,
 ): HookScript[] {
   const allowed = new Set<string>(SHARED_HOOKS_BY_PLATFORM[platform]);
+  allowed.add("trellis_hook_io.py");
   return getSharedHookScripts().filter((h) => allowed.has(h.name));
 }

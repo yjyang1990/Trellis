@@ -14,6 +14,7 @@
 import { AI_TOOLS } from "../types/ai-tools.js";
 import { getAllAgents } from "../templates/reasonix/index.js";
 import {
+  applyPullBasedPreludeMarkdown,
   collectSkillTemplates,
   resolveAllAsSkills,
   resolveBundledSkills,
@@ -28,7 +29,8 @@ export function collectReasonixTemplates(): Map<string, string> {
   const files = new Map<string, string>();
 
   // Subagent skill names that replace common-skill equivalents.
-  const agentNames = new Set(getAllAgents().map((a) => a.name));
+  const agents = applyPullBasedPreludeMarkdown(getAllAgents());
+  const agentNames = new Set(agents.map((a) => a.name));
 
   // Workflow skills filtered to avoid collision with subagent skills.
   const skills = resolveAllAsSkills(ctx).filter((s) => !agentNames.has(s.name));
@@ -43,7 +45,7 @@ export function collectReasonixTemplates(): Map<string, string> {
 
   // Subagent skills (trellis-implement, trellis-check) — written with
   // runAs: subagent frontmatter for isolated subagent loops.
-  for (const agent of getAllAgents()) {
+  for (const agent of agents) {
     files.set(`.reasonix/skills/${agent.name}/SKILL.md`, agent.content);
   }
 

@@ -25,6 +25,7 @@ import {
   getMigrationsForVersion,
   hasPendingMigrations,
 } from "../src/migrations/index.js";
+import { readAgentTemplate } from "../src/templates/read-agent-template.js";
 import { isManagedPath } from "../src/configurators/index.js";
 import { AI_TOOLS } from "../src/types/ai-tools.js";
 import { PATHS } from "../src/constants/paths.js";
@@ -2799,6 +2800,12 @@ describe("regression: current-task path normalization", () => {
   function writeProjectFile(relativePath: string, content: string): void {
     const absPath = path.join(tmpDir, relativePath);
     fs.mkdirSync(path.dirname(absPath), { recursive: true });
+    if (content.includes("from trellis_hook_io import load_hook_input")) {
+      fs.copyFileSync(
+        path.join(__dirname, "../src/templates/shared-hooks/trellis_hook_io.py"),
+        path.join(path.dirname(absPath), "trellis_hook_io.py"),
+      );
+    }
     fs.writeFileSync(absPath, content, "utf-8");
   }
 
@@ -2918,7 +2925,7 @@ describe("regression: current-task path normalization", () => {
       pythonCmd,
       [
         "-c",
-        "import runpy, sys; sys.stdout.reconfigure(encoding='utf-8', errors='replace'); runpy.run_path(sys.argv[1], run_name='__main__')",
+        "import os, runpy, sys; sys.path[0] = os.path.dirname(sys.argv[1]); sys.stdout.reconfigure(encoding='utf-8', errors='replace'); runpy.run_path(sys.argv[1], run_name='__main__')",
         scriptPath,
       ],
       {
@@ -6760,6 +6767,10 @@ print(json.dumps({
         ),
         hookPath,
       );
+      fs.copyFileSync(
+        path.join(__dirname, "../src/templates/shared-hooks/trellis_hook_io.py"),
+        path.join(nonTrellisDir, "trellis_hook_io.py"),
+      );
       const result = execSync(`${pythonCmd} ${JSON.stringify(hookPath)}`, {
         cwd: nonTrellisDir,
         input: JSON.stringify({ cwd: nonTrellisDir }),
@@ -6771,55 +6782,253 @@ print(json.dumps({
     }
   });
 
-  it("[#356] inject-workflow-state.py exits when host leaves stdin open with no payload", async () => {
+  const hookEntryPoints = [
+    [".claude", "session-start.py", claudeSessionStart],
+    [".codex", "session-start.py", codexSessionStart],
+    [".github/copilot", "session-start.py", copilotSessionStart],
+    ...getSharedHookScripts()
+      .filter((hook) => hook.name.startsWith("inject-"))
+      .map((hook) => [".cursor", hook.name, hook.content] as const),
+  ] as const;
+
+  it.each(hookEntryPoints)(
+    "[#356] %s/hooks/%s exits with stdin held open",
+    async (platform, name, content) => {
+      setupTaskRepo();
+      const script = path.join(platform, "hooks", name);
+      writeProjectFile(script, expectTemplateContent(content, name));
+      const child = spawn(pythonCmd, [path.join(tmpDir, script)], {
+        cwd: tmpDir,
+        env: sessionEnv({ CLAUDE_PROJECT_DIR: tmpDir }),
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 4000,
+        killSignal: "SIGKILL",
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf-8").on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.setEncoding("utf-8").on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      // Keep the writer open until Python exits. A timeout kills and reaps the child.
+      const code = await new Promise<number | null>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", resolve);
+      });
+      expect(code, stderr).toBe(0);
+      expect(stderr).not.toMatch(
+        /Traceback|Fatal Python error|Trellis hook skipped/,
+      );
+      if (name === "session-start.py")
+        expect(stdout).toContain("<session-context>");
+      else if (name === "inject-workflow-state.py")
+        expect(stdout).toContain("<workflow-state>");
+      else expect(stdout).toBe("");
+    },
+  );
+
+  it.each(["directory", "worktree file", "ordinary package"])(
+    "root discovery respects a %s under the outer checkout",
+    (kind) => {
+      setupTaskRepo();
+      writeProjectFile(".git/HEAD", "ref: refs/heads/main\n");
+      writeProjectFile("nested/package/index.txt", "package\n");
+      if (kind === "directory")
+        writeProjectFile("nested/.git/HEAD", "ref: refs/heads/main\n");
+      if (kind === "worktree file")
+        writeProjectFile("nested/.git", "gitdir: ../.git/worktrees/nested\n");
+      const cwd = path.join(tmpDir, "nested/package");
+      const runtime = path.join(tmpDir, ".trellis/.runtime");
+      const names = [
+        "inject-workflow-state.py",
+        "inject-shell-session-context.py",
+      ];
+      for (const name of names) {
+        const content = getSharedHookScripts().find(
+          (hook) => hook.name === name,
+        )?.content;
+        writeProjectFile(
+          path.join(".cursor/hooks", name),
+          expectTemplateContent(content, name),
+        );
+      }
+      const snapshot = () =>
+        fs
+          .readdirSync(tmpDir, { recursive: true, encoding: "utf8" })
+          .sort()
+          .map((rel) => {
+            const file = path.join(tmpDir, rel);
+            return [
+              rel,
+              fs.statSync(file).isFile() ? fs.readFileSync(file) : null,
+            ];
+          });
+      const before = snapshot();
+      for (const name of names) {
+        const script = path.join(".cursor/hooks", name);
+        const result = spawnSync(pythonCmd, [path.join(tmpDir, script)], {
+          cwd: tmpDir,
+          input: JSON.stringify({
+            cwd,
+            session_id: "isolated",
+            command: "python3 .trellis/scripts/task.py current",
+          }),
+          env: sessionEnv({ PYTHONDONTWRITEBYTECODE: "" }),
+          encoding: "utf-8",
+          timeout: 4000,
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stderr).toBe("");
+        if (kind !== "ordinary package") expect(result.stdout).toBe("");
+        else if (name === "inject-workflow-state.py")
+          expect(result.stdout).toContain("<workflow-state>");
+        else expect(JSON.parse(result.stdout)).toEqual({ permission: "allow" });
+      }
+      if (kind === "ordinary package")
+        expect(fs.readdirSync(path.join(runtime, "shell-tickets"))).toHaveLength(
+          1,
+        );
+      else expect(snapshot()).toEqual(before);
+    },
+  );
+
+  it.each(["object", "partial", "malformed", "concatenated"] as const)(
+    "shell hook validates a flushed %s with stdin still open",
+    async (shape) => {
+      setupTaskRepo();
+      const name = "inject-shell-session-context.py";
+      const script = path.join(".cursor/hooks", name);
+      writeProjectFile(
+        script,
+        expectTemplateContent(
+          getSharedHookScripts().find((hook) => hook.name === name)?.content,
+          name,
+        ),
+      );
+      const event = JSON.stringify({
+        cwd: tmpDir,
+        session_id: "delayed-eof",
+        command: "python3 .trellis/scripts/task.py current",
+      });
+      const raw = {
+        object: event,
+        partial: event.slice(0, -1),
+        malformed: event + "!",
+        concatenated: event + event,
+      };
+      const child = spawn(pythonCmd, [path.join(tmpDir, script)], {
+        cwd: tmpDir,
+        env: sessionEnv(),
+        timeout: 4000,
+        killSignal: "SIGKILL",
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf-8").on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.setEncoding("utf-8").on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.stdin.write(raw[shape]);
+      const code = await new Promise<number | null>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", resolve);
+      });
+      expect(code, stderr).toBe(0);
+      expect(stderr).toBe("");
+      const tickets = path.join(tmpDir, ".trellis/.runtime/shell-tickets");
+      if (shape === "object") {
+        expect(JSON.parse(stdout)).toEqual({ permission: "allow" });
+        expect(fs.readdirSync(tickets)).toHaveLength(1);
+      } else {
+        expect(stdout).toBe("");
+        expect(fs.existsSync(tickets)).toBe(false);
+      }
+    },
+  );
+
+  it.each([Buffer.from([0xff, 0xfe]), Buffer.from("[1]")])(
+    "preserves task diagnostics for corrupt metadata %j",
+    (bytes) => {
+      setupTaskRepo();
+      writeSessionContext("metadata", ".trellis/tasks/issue-106");
+      fs.writeFileSync(
+        path.join(tmpDir, ".trellis/tasks/issue-106/task.json"),
+        bytes,
+      );
+      for (const [platform, name, content] of hookEntryPoints) {
+        if (name !== "session-start.py" && name !== "inject-workflow-state.py")
+          continue;
+        const script = path.join(platform, "hooks", name);
+        writeProjectFile(script, expectTemplateContent(content, name));
+        const output = runPython(script, JSON.stringify({ cwd: tmpDir }), {
+          CLAUDE_PROJECT_DIR: tmpDir,
+          TRELLIS_CONTEXT_ID: "metadata",
+        });
+        expect(output).toContain(
+          name === "session-start.py"
+            ? "Status: TASK ERROR"
+            : "issue-106 (task_error)",
+        );
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "hooks exit silently when the project runtime is missing (has .trellis = %s)",
+    (hasTrellis) => {
+      writeProjectFile(".git/HEAD", "ref: refs/heads/main\n");
+      if (hasTrellis) writeProjectFile(".trellis/workflow.md", "# Workflow\n");
+      // Catch accidental imports from another project when this one's runtime is absent.
+      writeProjectFile("foreign/common/__init__.py", "raise SystemExit(91)\n");
+      for (const [platform, name, content] of hookEntryPoints) {
+        const script = path.join(platform, "hooks", name);
+        writeProjectFile(script, expectTemplateContent(content, name));
+        const result = spawnSync(pythonCmd, [path.join(tmpDir, script)], {
+          cwd: tmpDir,
+          env: sessionEnv({
+            CLAUDE_PROJECT_DIR: tmpDir,
+            PYTHONPATH: path.join(tmpDir, "foreign"),
+          }),
+          input: JSON.stringify({
+            cwd: tmpDir,
+            session_id: "isolated",
+            command: "python3 .trellis/scripts/task.py current",
+            tool_name: "Task",
+            tool_input: {
+              subagent_type: "trellis-research",
+              prompt: "inspect",
+            },
+          }),
+          encoding: "utf-8",
+          timeout: 4000,
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toBe("");
+      }
+    },
+  );
+
+  it("malformed tool events emit no permission response", () => {
     setupTaskRepo();
-    writeWorkflowStateHook();
-
-    const hookPath = path.join(
-      tmpDir,
-      ".trellis",
-      "hooks",
-      "inject-workflow-state.py",
-    );
-    const child = spawn(pythonCmd, [hookPath], {
-      cwd: tmpDir,
-      env: sessionEnv({ KIRO_PROJECT_DIR: tmpDir }),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf-8");
-    child.stderr.setEncoding("utf-8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-
-    const result = await new Promise<{
-      code: number | null;
-      signal: NodeJS.Signals | null;
-      timedOut: boolean;
-    }>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        child.kill("SIGKILL");
-        resolve({ code: null, signal: "SIGKILL", timedOut: true });
-      }, 1500);
-      child.once("error", (error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
-      child.once("exit", (code, signal) => {
-        clearTimeout(timer);
-        resolve({ code, signal, timedOut: false });
-      });
-    });
-
-    expect(result.timedOut, stderr).toBe(false);
-    expect(result.code).toBe(0);
-    expect(stdout).toContain("<workflow-state>");
+    writeProjectFile(".git/HEAD", "ref: refs/heads/main\n");
+    for (const [platform, name, content] of hookEntryPoints) {
+      if (!name.includes("shell-session") && !name.includes("subagent"))
+        continue;
+      const script = path.join(platform, "hooks", name);
+      writeProjectFile(script, expectTemplateContent(content, name));
+      for (const input of [
+        "{",
+        "[]",
+        JSON.stringify({ cwd: tmpDir, tool_name: ["Task"], command: 5 }),
+      ]) {
+        expect(runPython(script, input)).toBe("");
+      }
+    }
   });
 
   // ------------------------------------------------------------
@@ -7431,10 +7640,7 @@ print(len(entries))
     ];
 
     for (const relativePath of agentFiles) {
-      const content = fs.readFileSync(
-        path.join(templateRoot, relativePath),
-        "utf-8",
-      );
+      const content = readAgentTemplate(path.join(templateRoot, relativePath));
       expect(content, `${relativePath} should mention recursion guard`).toMatch(
         /Recursion guard|Recursion Guard/,
       );
@@ -9775,7 +9981,7 @@ describe("regression: parse_simple_yaml uses _unquote not greedy strip (0.3.8)",
     // The bug: .strip('"').strip("'") greedily eats nested quotes
     // e.g. "echo 'hello'" -> strip("'") -> echo 'hello (broken!)
     expect(commonTrellisConfig).not.toContain(".strip('\"').strip(\"'\")");
-    expect(commonTrellisConfig).toContain("_unquote(stripped[2:].strip())");
+    expect(commonTrellisConfig).toContain("items.append(_unquote(value))");
   });
 
   it("trellis_config.py uses _unquote for key-value, not .strip('\"')", () => {
@@ -9884,9 +10090,9 @@ describe("regression: parse_simple_yaml Python execution (0.3.8)", () => {
       "packages:\n  - name: cli\n    path: packages/cli\n",
     );
     expect(result).not.toHaveProperty("path");
-    expect(result).toEqual({ packages: ["name: cli"] });
+    expect(result).toEqual({ packages: [] });
     expect(stderr).toContain("mappings inside a list are not supported");
-    expect(stderr).toContain("path: packages/cli");
+    expect(stderr).toContain("- name: cli");
   });
 
   it("block scalars are reported and their body is not leaked", () => {
@@ -10288,7 +10494,7 @@ describe("regression: research agent persists findings to task dir", () => {
 
   for (const rel of markdownPlatforms) {
     it(`[${rel}] has Write tool and persist instruction`, () => {
-      const content = fs.readFileSync(path.join(repoRoot, rel), "utf-8");
+      const content = readAgentTemplate(path.join(repoRoot, rel));
       // Frontmatter tool list must include Write (capitalized form)
       const fm = content.split("---\n")[1] ?? "";
       expect(fm).toMatch(/tools:\s*[^\n]*\bWrite\b/);
@@ -10307,7 +10513,7 @@ describe("regression: research agent persists findings to task dir", () => {
   // applies (body references {TASK_DIR}/research/ and the PERSIST keyword).
   it("[packages/cli/src/templates/gemini/agents/trellis-research.md] omits tools line + has persist instruction", () => {
     const rel = "packages/cli/src/templates/gemini/agents/trellis-research.md";
-    const content = fs.readFileSync(path.join(repoRoot, rel), "utf-8");
+    const content = readAgentTemplate(path.join(repoRoot, rel));
     const fm = content.split("---\n")[1] ?? "";
     expect(fm).not.toMatch(/^tools:/m);
     expect(content).toContain("{TASK_DIR}/research/");
@@ -10787,7 +10993,7 @@ describe("regression: sub-agent context injection fallback (0.5.3)", () => {
 
   for (const { platform, rel, agent } of CLASS1_MD_AGENT_FILES) {
     it(`${platform}/${agent} markdown agent file carries marker + fallback protocol`, () => {
-      const content = fs.readFileSync(path.join(repoRootFb, rel), "utf-8");
+      const content = readAgentTemplate(path.join(repoRootFb, rel));
       // 1. References the marker
       expect(content).toContain(HOOK_INJECTED_MARKER);
       // 2. Has the protocol heading
@@ -10830,7 +11036,7 @@ describe("regression: sub-agent context injection fallback (0.5.3)", () => {
 
   for (const rel of GEMINI_QODER_AGENT_FILES) {
     it(`${rel} references task artifacts`, () => {
-      const content = fs.readFileSync(path.join(repoRootFb, rel), "utf-8");
+      const content = readAgentTemplate(path.join(repoRootFb, rel));
       expectTaskArtifactContract(content);
     });
   }

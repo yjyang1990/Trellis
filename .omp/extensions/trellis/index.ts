@@ -65,62 +65,148 @@ function isInsideRoot(root: string, candidate: string): boolean {
 
 const AUTO_TRUST_ENTRIES = ["tasks", "workspace"];
 
-function stripTrustValue(s: string): string {
-   return s.trim().replace(/\s*#.*$/, "").trim().replace(/^['"]|['"]$/g, "");
+/** Minimal config.yaml subset shared with common/trellis_config.py. */
+interface ConfigMap {
+  [key: string]: string | string[] | ConfigMap | undefined;
 }
 
-function parseChannelTrustSection(content: string): { trustedDirs: string[]; autoTrustSymlinks?: boolean } {
-   const lines = content.split("\n");
-   const trustedDirs: string[] = [];
-   let autoTrustSymlinks: boolean | undefined;
-   let inChannel = false;
-   let inList = false;
+function configMap(value: ConfigMap[string]): ConfigMap {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : (Object.create(null) as ConfigMap);
+}
 
-   for (const raw of lines) {
-      const line = raw.replace(/\r$/, "");
-      const trimmed = line.trimEnd();
-      if (trimmed.trim().startsWith("#")) continue;
+/** Keep the whitespace before a comment available to text-preserving writers. */
+function beforeConfigComment(text: string): string {
+  let quote: string | undefined;
+  let previous = "";
+  let offset = 0;
+  for (const ch of text) {
+    if (quote) {
+      if (ch === quote) quote = undefined;
+    } else if (ch === "#" && (!previous || /\s/.test(previous))) {
+      return text.slice(0, offset);
+    } else if (ch === '"' || ch === "'") {
+      // A plain word may contain or end with an apostrophe.
+      if (ch !== "'" || !/[\p{L}\p{N}_]/u.test(previous)) quote = ch;
+    }
+    previous = ch;
+    offset += ch.length;
+  }
+  return text;
+}
 
-      if (/^channel:\s*$/.test(trimmed)) {
-         inChannel = true;
-         inList = false;
-         continue;
+function configScalar(raw: string, listItem: boolean): string | undefined {
+  const value = beforeConfigComment(raw).trim();
+  if (listItem && /^(?:"[^"]*"|'[^']*')\s*:(?:\s|$)/.test(value))
+    return undefined;
+  if (
+    value.length >= 2 &&
+    (value[0] === '"' || value[0] === "'") &&
+    value.at(-1) === value[0]
+  ) {
+    return value.slice(1, -1);
+  }
+  if (/^[&*[{]|^[|>][+\-\d]*$/.test(value)) return undefined;
+  if (listItem && (!value || /:(?:\s|$)|^-(?:\s|$)/.test(value)))
+    return undefined;
+  return value;
+}
+
+type OnKey = (
+  parent: ConfigMap,
+  key: string,
+  line: number,
+  raw: string,
+) => void;
+
+function parseTrellisConfig(content: string, onKey?: OnKey): ConfigMap {
+  const lines = content
+    .split(/\r?\n/)
+    .map((text, line) => ({
+      text: text.trim(),
+      indent: text.length - text.trimStart().length,
+      line,
+    }))
+    .filter(({ text }) => text && !text.startsWith("#"));
+  let i = 0;
+  const isItem = (text: string): boolean => /^-(?:\s|$)/.test(text);
+  function skipBody(indent: number): void {
+    while (i < lines.length && lines[i].indent > indent) i++;
+  }
+  function mapping(indent: number): ConfigMap {
+    const result: ConfigMap = Object.create(null) as ConfigMap;
+    while (i < lines.length && lines[i].indent >= indent) {
+      const row = lines[i++];
+      const colon = row.text.indexOf(":");
+      if (row.indent !== indent || colon < 1 || isItem(row.text)) {
+        skipBody(row.indent);
+        continue;
       }
-      if (!inChannel) continue;
-
-      if (trimmed.trim() !== "" && /^\S/.test(line)) {
-         inChannel = false;
-         inList = false;
-         continue;
+      const key = row.text.slice(0, colon).trim();
+      const raw = row.text.slice(colon + 1);
+      onKey?.(result, key, row.line, raw);
+      if (key === "<<" || beforeConfigComment(raw).trim()) {
+        const value = configScalar(raw, false);
+        if (key !== "<<" && value !== undefined) result[key] = value;
+        skipBody(indent);
+        continue;
       }
-      if (trimmed.trim() === "") continue;
-
-      if (inList) {
-         const item = trimmed.match(/^ {4}-\s*(.+)$/);
-         if (item) {
-            const val = stripTrustValue(item[1]!);
-            if (val) trustedDirs.push(val);
-            continue;
-         }
-         inList = false;
+      const next = lines[i];
+      if (next && next.indent >= indent && isItem(next.text)) {
+        const items: string[] = [];
+        while (
+          i < lines.length &&
+          lines[i].indent === next.indent &&
+          isItem(lines[i].text)
+        ) {
+          const value = configScalar(lines[i++].text.slice(1), true);
+          if (
+            value !== undefined &&
+            !(i < lines.length && lines[i].indent > next.indent)
+          ) {
+            items.push(value);
+          }
+          skipBody(next.indent);
+        }
+        result[key] = items;
+      } else {
+        result[key] =
+          next && next.indent > indent
+            ? mapping(next.indent)
+            : configMap(undefined);
       }
+    }
+    return result;
+  }
+  return mapping(0);
+}
 
-      if (/^ {2}trusted_context_dirs:\s*$/.test(trimmed)) {
-         inList = true;
-         continue;
-      }
+interface ChannelTrustConfig {
+  trustedDirs: string[];
+  autoTrustSymlinks?: boolean;
+}
 
-      const boolMatch = trimmed.match(/^ {2}auto_trust_trellis_symlinks:\s*(.+)$/);
-      if (boolMatch) {
-         const val = stripTrustValue(boolMatch[1]!).toLowerCase();
-         if (val === "false") autoTrustSymlinks = false;
-         else if (val === "true") autoTrustSymlinks = true;
-         else process.stderr.write(`[channel] channel.auto_trust_trellis_symlinks: invalid value '${val}', ignoring\n`);
-         continue;
-      }
-   }
-
-   return { trustedDirs, autoTrustSymlinks };
+/**
+ * Parse the `channel.trusted_context_dirs` (list) and
+ * `channel.auto_trust_trellis_symlinks` (bool) keys out of
+ * `.trellis/config.yaml`.
+ */
+function parseChannelTrustSection(content: string): ChannelTrustConfig {
+  const channel = configMap(parseTrellisConfig(content).channel);
+  const dirs = channel.trusted_context_dirs;
+  const trustedDirs = Array.isArray(dirs) ? dirs.filter(Boolean) : [];
+  let autoTrustSymlinks: boolean | undefined;
+  if (typeof channel.auto_trust_trellis_symlinks === "string") {
+    const val = channel.auto_trust_trellis_symlinks.toLowerCase();
+    if (val === "false") autoTrustSymlinks = false;
+    else if (val === "true") autoTrustSymlinks = true;
+    else
+      process.stderr.write(
+        `[channel] channel.auto_trust_trellis_symlinks: invalid value '${val}', ignoring\n`,
+      );
+  }
+  return { trustedDirs, autoTrustSymlinks };
 }
 
 function resolveTrustedRoots(projectRoot: string): string[] {

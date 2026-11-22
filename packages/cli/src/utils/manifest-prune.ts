@@ -107,6 +107,8 @@ export interface PruneOptions {
    * (dry-run, change-analysis passes).
    */
   persist?: boolean;
+  /** Exact historical file paths needed by update to classify directory migrations. */
+  legacySourceFiles?: ReadonlySet<string>;
 }
 
 /**
@@ -148,7 +150,7 @@ export function pruneOrphanManifestKeys(
       }
       continue;
     }
-    if (known.has(key)) {
+    if (known.has(key) || options.legacySourceFiles?.has(key)) {
       kept[key] = value;
       continue;
     }

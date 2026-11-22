@@ -24,13 +24,14 @@ integration via env wiring and storage layout).
 event schemas, reducers, durable mutation APIs, idempotency, worker registry,
 inbox policy, and public SDK contracts.
 
-`packages/cli/src/commands/channel/store/*` still exists and is current code,
-not dead code. Some files are thin re-export / compatibility modules over core
-(`schema.ts`, `filter.ts`, `thread-state.ts`, and `events.ts` `appendEvent` /
-`readLastSeq`). Others remain CLI-local runtime primitives for supervisor /
-spawn / kill / wait paths during the supervisor migration (`paths.ts`,
-`lock.ts`, `watch.ts`, plus the full-file `readChannelEvents` in `events.ts`).
-Do not delete these wrappers until their callers have moved to core APIs.
+Core owns the channel layout, bucket selection and migration, lock algorithm,
+and event watcher. The CLI's `store/paths.ts`, `lock.ts`, and `watch.ts` use
+named exports from `@mindfoldhq/trellis-core/channel`. The positional CLI
+resolver delegates to `resolveChannelRef`. The CLI uses the lower-level
+`watchEvents` so a watch still starts at iteration time in the selected bucket.
+The full-file reader in CLI `store/events.ts` skips malformed records and
+returns an empty history for a missing file. Worker supervision, lock scope,
+and pid and cursor sidecar management remain CLI responsibilities.
 
 Sequence allocation belongs to core. A torn JSONL tail (no trailing newline)
 is truncated to the last complete line before the next append; `seq` continues
@@ -261,7 +262,7 @@ trellis channel thread rename <name> <old-thread> <new-thread> [opts]
 ### Internal modules
 
 ```ts
-// store/paths.ts (storage-layer signatures)
+// Core internal/store/paths.ts (storage-layer signatures)
 channelRoot(): string                                       // TRELLIS_CHANNEL_ROOT ?? ~/.trellis/channels
 projectKey(cwd: string): string                             // sanitize: /[\\/_]/g→"-" then /[^A-Za-z0-9.-]/g→"-"
 currentProjectKey(): string                                 // TRELLIS_CHANNEL_PROJECT env ?? projectKey(process.cwd())
@@ -1136,7 +1137,7 @@ trellis channel send trellis-issue --scope global --as main --thread forum-mode 
 | `channel run` failure preserves | e2e | run with bad provider; assert exit 1, stderr matches "channel kept for inspection:", channel directory still exists, `events.jsonl` has create+error |
 | `--ephemeral` create + list + prune | integration | (a) `list` default hides, (b) `list --all` shows with `*`, (c) `list` footer prints "(N ephemeral channels hidden ...)", (d) `prune --ephemeral` only deletes ephemeral, (e) `prune --ephemeral --idle 1h` throws mutex error |
 | Path-traversal jail | security | `--file /etc/passwd` from cwd `/tmp/work` → file skipped, stderr warn |
-| `assertSafeName` / `channelDir` traversal guard | security | (a) `".."`, `"."`, `"../x"`, `"../../x"`, `"a/b"`, `"a\b"` → throw `Invalid channel name`, (b) ordinary names (`"a"`, `"chat-only"`, `"a.b"`) accepted, (c) `channelDir("../../escape")` throws before resolving a path — duplicated in both `core` and `cli` copies of `paths.ts` |
+| `assertSafeName` / `channelDir` traversal guard | security | (a) `".."`, `"."`, `"../x"`, `"../../x"`, `"a/b"`, `"a\b"` → throw `Invalid channel name`, (b) ordinary names (`"a"`, `"chat-only"`, `"a.b"`) accepted, (c) `channelDir("../../escape")` throws before resolving a path through the shared core helper |
 | Agent name validator | security | `--agent ../../evil` → throw |
 | Frontmatter prototype pollution | security | a `.trellis/agents/<name>.md` fixture with `__proto__: ...` frontmatter → key dropped, no pollution observable |
 | `safeIdentifier` | unit | newline / NUL / control chars stripped from worker name in protocol prompt |

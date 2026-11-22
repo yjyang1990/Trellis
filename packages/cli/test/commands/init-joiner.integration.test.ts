@@ -24,7 +24,8 @@ vi.mock("inquirer", () => ({
   default: { prompt: vi.fn().mockResolvedValue({}) },
 }));
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   execSync: vi.fn().mockImplementation((cmd: string) => {
     const py = process.platform === "win32" ? "python" : "python3";
     return cmd === `${py} --version` ? "Python 3.11.12" : "";
@@ -88,7 +89,7 @@ describe("init() joiner onboarding", () => {
     simulateExistingCheckout();
     fs.writeFileSync(
       path.join(tmpDir, PATHS.DEVELOPER_FILE),
-      `${name}\n`,
+      `name=${name}\n`,
       "utf-8",
     );
   }
@@ -141,7 +142,7 @@ describe("init() joiner onboarding", () => {
     expect(prd).toContain("archive is empty");
     const expectedPythonCmd = process.platform === "win32" ? "python" : "python3";
     expect(prd).toContain(
-      `${expectedPythonCmd} ./.trellis/scripts/task.py list --assignee bob`,
+      `${expectedPythonCmd} ./.trellis/scripts/task.py list --mine`,
     );
     expect(prd).toContain(`${expectedPythonCmd} ./.trellis/scripts/task.py finish`);
     expect(prd).toContain(
@@ -219,13 +220,7 @@ describe("init() joiner onboarding", () => {
     const joinerPath = path.join(tmpDir, PATHS.TASKS, "00-join-dave");
     expect(fs.existsSync(joinerPath)).toBe(true);
 
-    // Manually create the .developer file that init_developer.py would have
-    // written (it's mocked in this test), then archive the joiner task.
-    fs.writeFileSync(
-      path.join(tmpDir, PATHS.DEVELOPER_FILE),
-      "dave\n",
-      "utf-8",
-    );
+    // Archive the joiner task, leaving the initialized identity in place.
     fs.rmSync(joinerPath, { recursive: true, force: true });
 
     // Re-init: should NOT recreate the joiner task
@@ -346,10 +341,36 @@ describe("init() joiner onboarding", () => {
     );
   });
 
-  it("#8 handleReinit path: existing .trellis/ + .developer → no task created", async () => {
-    simulateSameDevReinit("grace");
+  it("initializes a new checkout from Git once and preserves its effective identity", async () => {
+    simulateExistingCheckout();
+    fs.mkdirSync(path.join(tmpDir, ".git"));
+    vi.mocked(execSync).mockImplementation(((cmd: string) =>
+      cmd === "git config user.name" ? "Git User" : "Python 3.11.12") as typeof execSync);
 
-    await init({ yes: true, user: "grace" });
+    await init({ yes: true });
+    const identity = path.join(tmpDir, PATHS.DEVELOPER_FILE);
+    const initial = fs.readFileSync(identity, "utf-8");
+    expect(initial).toContain("name=Git User\n");
+    const joiner = path.join(tmpDir, PATHS.TASKS, "00-join-git-user");
+    expect(fs.existsSync(joiner)).toBe(true);
+    fs.rmSync(joiner, { recursive: true });
+
+    await init({ yes: true });
+    expect(fs.readFileSync(identity, "utf-8")).toBe(initial);
+    expect(fs.existsSync(joiner)).toBe(false);
+  });
+
+  it("preserves an existing Unicode identity when -u requests another name", async () => {
+    simulateSameDevReinit("김민수");
+    vi.stubEnv("PYTHONIOENCODING", "cp1252");
+    try {
+      await init({ yes: true, user: "grace" });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(fs.readFileSync(path.join(tmpDir, PATHS.DEVELOPER_FILE), "utf-8"))
+      .toBe("name=김민수\n");
+    expect(fs.existsSync(path.join(tmpDir, PATHS.WORKSPACE, "grace"))).toBe(false);
 
     expect(
       fs.existsSync(path.join(tmpDir, PATHS.TASKS, "00-join-grace")),

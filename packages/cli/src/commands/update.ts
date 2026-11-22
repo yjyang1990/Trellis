@@ -8,26 +8,42 @@ import { DIR_NAMES, FILE_NAMES, PATHS } from "../constants/paths.js";
 import type { AITool } from "../types/ai-tools.js";
 import { VERSION, PACKAGE_NAME } from "../constants/version.js";
 import {
+  requireMigrationManifest,
   getMigrationsForVersion,
   getAllMigrations,
   getMigrationMetadata,
   getConfigSectionsAddedBetween,
 } from "../migrations/index.js";
+import {
+  checkLegacyPaths,
+  platformsFromReceipts040,
+  readFlatReceipt040,
+  cleanLegacyRalphSettings,
+  retiredRalphHook,
+} from "../migrations/flat-receipt.js";
+import {
+  classifyMigrations,
+  dirHasManifestEntries,
+  executeMigrations,
+  isProtectedPath,
+  printMigrationResult,
+  printMigrationSummary,
+  PROTECTED_PATHS,
+  renameTracesToJournal,
+} from "../migrations/file-migrations.js";
+import { writeFileAtomic } from "../utils/atomic-write.js";
+import { legacyRenameSourceFiles } from "../migrations/legacy-directory-files.js";
 import type {
   ConfigSectionAdded,
   MigrationItem,
   ClassifiedMigrations,
-  MigrationResult,
-  MigrationAction,
   TemplateHashes,
 } from "../types/migration.js";
 import {
   loadHashes,
   saveHashes,
   updateHashes,
-  isTemplateModified,
   removeHash,
-  renameHash,
   computeHash,
   shouldExcludeFromHash,
 } from "../utils/template-hash.js";
@@ -72,7 +88,8 @@ import {
   downloadTemplateById,
   type RegistrySource,
 } from "../utils/template-fetcher.js";
-import { loadSpecRegistryConfig } from "../utils/registry-config.js";
+import { configMap, parseTrellisConfig } from "../utils/trellis-config.js";
+import { withSpecRegistryConfig, loadSpecRegistryConfig } from "../utils/registry-config.js";
 import {
   cleanupEmptyDirs,
   TRELLIS_BLOCK_END,
@@ -84,6 +101,14 @@ export {
   TRELLIS_BLOCK_END,
   TRELLIS_BLOCK_START,
 } from "../utils/managed-paths.js";
+
+export {
+  classifyMigrations,
+  dirHasManifestEntries,
+  executeMigrations,
+  renameTracesToJournal,
+  sortMigrationsForExecution,
+} from "../migrations/file-migrations.js";
 
 export interface UpdateOptions {
   dryRun?: boolean;
@@ -114,22 +139,14 @@ type ConflictAction = "overwrite" | "skip" | "create-new";
 
 const CLAUDE_SETTINGS_PATH = ".claude/settings.json";
 const LEGACY_UNTRACKED_AGENTS_MD_BLOCK_HASHES = new Set<string>([
+  // Released v0.4.0 managed block.
+  "6dcb457d1ca758ea79cbff5153b048f36158a27821fb94f933b30e210ad64f0c",
   // v0.5.0-beta.17 and earlier wrote AGENTS.md but did not hash-track it.
   // This hash is the pristine Trellis-managed block before the Subagents
   // section was added, so old untouched projects can be updated without a
   // false "modified by you" conflict.
   "c1f511b1cfc1902f2147da159f09cc51f380b0c9e341cdb3ac5dea5233f3e307",
 ]);
-
-// Paths that should never be touched (true user data)
-// spec/ is user-customized content created during init; update should never modify it
-const PROTECTED_PATHS = [
-  `${DIR_NAMES.WORKFLOW}/${DIR_NAMES.WORKSPACE}`, // workspace/
-  `${DIR_NAMES.WORKFLOW}/${DIR_NAMES.TASKS}`, // tasks/
-  `${DIR_NAMES.WORKFLOW}/${DIR_NAMES.SPEC}`, // spec/
-  `${DIR_NAMES.WORKFLOW}/.developer`,
-  `${DIR_NAMES.WORKFLOW}/.current-task`,
-];
 
 function getManagedBlock(
   content: string,
@@ -259,6 +276,13 @@ function isKnownUntrackedTemplate(
   relativePath: string,
   existingContent: string,
 ): boolean {
+  if (relativePath === ".trellis/.gitignore") {
+    // The 0.4.0 installer excluded its bundled ignore file from the receipt.
+    return (
+      computeHash(existingContent) ===
+      "c549b846e9ce389521afe4738a1dc3ea5531f762d98413d41ed2c3651b2f09ca"
+    );
+  }
   if (relativePath !== FILE_NAMES.AGENTS) {
     return false;
   }
@@ -297,16 +321,6 @@ function isSafeUntrackedCopilotInstructionsMerge(
       COPILOT_INSTRUCTIONS_BLOCK_START,
       COPILOT_INSTRUCTIONS_BLOCK_END,
     ) === newContent
-  );
-}
-
-/**
- * Check if a path is blocked by PROTECTED_PATHS
- */
-function isProtectedPath(filePath: string): boolean {
-  return PROTECTED_PATHS.some(
-    (pp) =>
-      filePath === pp || filePath.startsWith(pp.endsWith("/") ? pp : pp + "/"),
   );
 }
 
@@ -489,54 +503,8 @@ export function loadUpdateSkipPaths(cwd: string): string[] {
 
   try {
     const content = fs.readFileSync(configPath, "utf-8");
-    const lines = content.split("\n");
-    const paths: string[] = [];
-    let inUpdate = false;
-    let inSkip = false;
-
-    for (const line of lines) {
-      const trimmed = line.trimEnd();
-
-      // Check for "update:" section (no indentation or at root level)
-      if (/^update:\s*$/.test(trimmed)) {
-        inUpdate = true;
-        inSkip = false;
-        continue;
-      }
-
-      // Check for "skip:" under update (indented)
-      if (inUpdate && /^\s+skip:\s*$/.test(trimmed)) {
-        inSkip = true;
-        continue;
-      }
-
-      // Collect list items under skip
-      if (inSkip) {
-        const match = trimmed.match(/^\s+-\s+(.+)$/);
-        if (match) {
-          paths.push(match[1].trim().replace(/^['"]|['"]$/g, ""));
-          continue;
-        }
-        // If line is non-empty and not a list item, we've left the skip section
-        if (trimmed !== "" && !trimmed.startsWith("#")) {
-          inSkip = false;
-          inUpdate = false;
-        }
-      }
-
-      // If we're in update but hit a non-indented line, we've left the update section
-      if (
-        inUpdate &&
-        trimmed !== "" &&
-        !trimmed.startsWith(" ") &&
-        !trimmed.startsWith("#")
-      ) {
-        inUpdate = false;
-        inSkip = false;
-      }
-    }
-
-    return paths;
+    const skip = configMap(parseTrellisConfig(content).update).skip;
+    return Array.isArray(skip) ? skip : [];
   } catch {
     // Config exists but failed to parse — warn user that skip rules won't apply
     console.warn(
@@ -743,21 +711,7 @@ function preserveExistingClaudeStatusLine(
 
 function preserveExistingRegistryConfig(cwd: string, template: string): string {
   const registry = loadSpecRegistryConfig(cwd);
-  if (!registry) return template;
-  return (
-    template.trimEnd() +
-    "\n\n" +
-    "#-------------------------------------------------------------------------------\n" +
-    "# Registry\n" +
-    "#-------------------------------------------------------------------------------\n\n" +
-    "# Source used to install .trellis/spec. trellis update refreshes this\n" +
-    "# hash-tracked spec template while preserving local edits through the\n" +
-    "# normal update conflict flow.\n" +
-    "registry:\n" +
-    "  spec:\n" +
-    `    source: ${registry.source}\n` +
-    (registry.template ? `    template: ${registry.template}\n` : "")
-  );
+  return registry ? withSpecRegistryConfig(template, registry) : template;
 }
 
 async function collectRegistrySpecTemplates(
@@ -962,6 +916,32 @@ async function collectTemplateFiles(
   return files;
 }
 
+/** A missing directory can be created. An existing file in its place must
+ * be resolved before migrating anything that would change the receipts. */
+function checkTemplatePath(
+  cwd: string,
+  diskPath: string,
+  templatePath: string,
+): void {
+  let relative = "";
+  for (const segment of diskPath.split("/")) {
+    relative = path.posix.join(relative, segment);
+    const fullPath = path.join(cwd, relative);
+    let entry = fs.lstatSync(fullPath, { throwIfNoEntry: false });
+    if (!entry) return;
+    // A relative link can resolve differently after its directory is moved.
+    // Keep existing in-place links usable when they resolve to the right type.
+    if (entry.isSymbolicLink() && diskPath === templatePath) {
+      entry = fs.statSync(fullPath, { throwIfNoEntry: false });
+    }
+    if (relative === diskPath ? !entry?.isFile() : !entry?.isDirectory()) {
+      throw new Error(
+        `${relative} blocks template ${templatePath}. Move or rename the blocking path and retry trellis update.`,
+      );
+    }
+  }
+}
+
 /**
  * Analyze changes between current files and templates
  *
@@ -987,6 +967,9 @@ function analyzeChanges(
   for (const [relativePath, newContent] of templates) {
     const fullPath = path.join(cwd, relativePath);
     const exists = fs.existsSync(fullPath);
+    if (exists || !hashes[relativePath]) {
+      checkTemplatePath(cwd, relativePath, relativePath);
+    }
 
     const change: FileChange = {
       path: fullPath,
@@ -1430,667 +1413,6 @@ function collectAllFiles(dirPath: string, cwd = process.cwd()): string[] {
 }
 
 /**
- * Whether every file under `dirRelativePath` byte-matches the CURRENT
- * template content for its path. Stricter than {@link isDirectorySafeToReplace},
- * which also accepts files that are merely unmodified relative to an old
- * stored hash (i.e. stale-but-untouched). Used to decide the safe *direction*
- * of a rename-dir merge when both source and target exist: if the target
- * already holds canonical current-version bytes, the source (however it got
- * there) must not be allowed to overwrite it with older/differently-flavored
- * content (#447 — a legacy `.pi/skills/` copy rendered with the Pi-specific
- * resolver must not clobber the shared, neutral `.agents/skills/` content
- * Codex/Gemini already wrote).
- */
-function dirMatchesCurrentTemplates(
-  cwd: string,
-  dirRelativePath: string,
-  templates: Map<string, string>,
-): boolean {
-  const dirFullPath = path.join(cwd, dirRelativePath);
-  if (!fs.existsSync(dirFullPath)) return false;
-
-  const files = collectAllFiles(dirFullPath, cwd);
-  if (files.length === 0) return false;
-
-  for (const fullPath of files) {
-    const relativePath = toPosix(path.relative(cwd, fullPath));
-    const templateContent = templates.get(relativePath);
-    if (templateContent === undefined) return false;
-    if (fs.readFileSync(fullPath, "utf-8") !== templateContent) return false;
-  }
-
-  return true;
-}
-
-/**
- * Check if a directory only contains unmodified template files
- * Returns true if safe to delete:
- * - All files are tracked and unmodified, OR
- * - All files match current template content (even if not tracked)
- */
-function isDirectorySafeToReplace(
-  cwd: string,
-  dirRelativePath: string,
-  hashes: TemplateHashes,
-  templates: Map<string, string>,
-): boolean {
-  const dirFullPath = path.join(cwd, dirRelativePath);
-  if (!fs.existsSync(dirFullPath)) return true;
-
-  const files = collectAllFiles(dirFullPath, cwd);
-  if (files.length === 0) return true; // Empty directory is safe
-
-  for (const fullPath of files) {
-    // POSIX-normalize: hashes/templates keys are persisted as POSIX, but
-    // `path.relative` returns OS-native separators (backslash on Windows).
-    const relativePath = toPosix(path.relative(cwd, fullPath));
-    const storedHash = hashes[relativePath];
-    const templateContent = templates.get(relativePath);
-
-    // Check if file matches template content (handles untracked files)
-    if (templateContent) {
-      const currentContent = fs.readFileSync(fullPath, "utf-8");
-      if (currentContent === templateContent) {
-        // File matches template - safe
-        continue;
-      }
-    }
-
-    // Check if file is tracked and unmodified
-    if (storedHash && !isTemplateModified(cwd, relativePath, hashes)) {
-      // Tracked and unmodified - safe
-      continue;
-    }
-
-    // File is either user-created or user-modified - not safe
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Recursively delete a directory
- */
-function removeDirectoryRecursive(dirPath: string): void {
-  if (!fs.existsSync(dirPath)) return;
-  fs.rmSync(dirPath, { recursive: true, force: true });
-}
-
-/**
- * Check if a file is safe to overwrite (matches template content)
- */
-function isFileSafeToReplace(
-  cwd: string,
-  relativePath: string,
-  templates: Map<string, string>,
-): boolean {
-  const fullPath = path.join(cwd, relativePath);
-  if (!fs.existsSync(fullPath)) return true;
-
-  const templateContent = templates.get(relativePath);
-  if (!templateContent) return false; // Not a template file
-
-  const currentContent = fs.readFileSync(fullPath, "utf-8");
-  return currentContent === templateContent;
-}
-
-/**
- * Classify migrations based on file state and user modifications
- */
-/**
- * Whether the manifest records any file under `dirRelativePath` — i.e. whether
- * Trellis actually created this directory. Used to gate rename-dir migrations:
- * a directory Trellis never wrote (e.g. a user's own `.windsurf/` editor
- * config that merely shares a path with a retired Trellis platform dir) must
- * not be auto-moved.
- */
-export function dirHasManifestEntries(
-  dirRelativePath: string,
-  hashes: TemplateHashes,
-): boolean {
-  const prefix = dirRelativePath.endsWith("/")
-    ? dirRelativePath
-    : dirRelativePath + "/";
-  return Object.keys(hashes).some(
-    (key) => key === dirRelativePath || key.startsWith(prefix),
-  );
-}
-
-export function classifyMigrations(
-  migrations: MigrationItem[],
-  cwd: string,
-  hashes: TemplateHashes,
-  templates: Map<string, string>,
-): ClassifiedMigrations {
-  const result: ClassifiedMigrations = {
-    auto: [],
-    confirm: [],
-    conflict: [],
-    skip: [],
-  };
-
-  for (const item of migrations) {
-    // safe-file-delete handled separately (not via --migrate)
-    if (item.type === "safe-file-delete") continue;
-
-    // Enforce PROTECTED_PATHS — never migrate FROM protected paths (prevents moving/deleting user data)
-    if (isProtectedPath(item.from)) {
-      result.skip.push(item);
-      continue;
-    }
-    // For non-rename types, also block writing TO protected paths
-    // rename/rename-dir are allowed to target protected paths (e.g., 0.2.0 renames into .trellis/workspace)
-    if (
-      item.to &&
-      isProtectedPath(item.to) &&
-      item.type !== "rename" &&
-      item.type !== "rename-dir"
-    ) {
-      result.skip.push(item);
-      continue;
-    }
-
-    const oldPath = path.join(cwd, item.from);
-    const oldExists = fs.existsSync(oldPath);
-
-    if (!oldExists) {
-      // Old file doesn't exist, nothing to migrate
-      result.skip.push(item);
-      continue;
-    }
-
-    if (item.type === "rename" && item.to) {
-      const newPath = path.join(cwd, item.to);
-      const newExists = fs.existsSync(newPath);
-
-      if (newExists) {
-        // Both exist - check if new file matches template (safe to overwrite)
-        if (isFileSafeToReplace(cwd, item.to, templates)) {
-          // New file is just template content - safe to delete and rename
-          result.auto.push(item);
-        } else {
-          // New file has user content - conflict
-          result.conflict.push(item);
-        }
-      } else if (isTemplateModified(cwd, item.from, hashes)) {
-        // User has modified the file - needs confirmation
-        result.confirm.push(item);
-      } else {
-        // Unmodified template - safe to auto-migrate
-        result.auto.push(item);
-      }
-    } else if (item.type === "rename-dir" && item.to) {
-      const newPath = path.join(cwd, item.to);
-      const newExists = fs.existsSync(newPath);
-
-      if (newExists) {
-        // Target exists - check if it only contains unmodified template files
-        if (isDirectorySafeToReplace(cwd, item.to, hashes, templates)) {
-          // Safe to delete target and rename source
-          result.auto.push(item);
-        } else {
-          // Target has user modifications - conflict
-          result.conflict.push(item);
-        }
-      } else if (dirHasManifestEntries(item.from, hashes)) {
-        // Trellis created this directory (the manifest tracks files under it),
-        // so the rename is ours to make.
-        result.auto.push(item);
-      } else {
-        // Target absent and the source has no manifest record: this is very
-        // likely a user-owned directory that merely shares a path with a
-        // retired Trellis platform dir (e.g. a real `.windsurf/` editor
-        // config). Skipping avoids silently moving the user's data out from
-        // under their editor — even under --force, since skip never executes.
-        result.skip.push(item);
-      }
-    } else if (item.type === "delete") {
-      if (isTemplateModified(cwd, item.from, hashes)) {
-        // User has modified - needs confirmation before delete
-        result.confirm.push(item);
-      } else {
-        // Unmodified - safe to auto-delete
-        result.auto.push(item);
-      }
-    }
-  }
-
-  return result;
-}
-
-/**
- * Print migration summary
- */
-function printMigrationSummary(classified: ClassifiedMigrations): void {
-  const total =
-    classified.auto.length +
-    classified.confirm.length +
-    classified.conflict.length +
-    classified.skip.length;
-
-  if (total === 0) {
-    console.log(chalk.gray("  No migrations to apply.\n"));
-    return;
-  }
-
-  if (classified.auto.length > 0) {
-    console.log(chalk.green("  ✓ Auto-migrate (unmodified):"));
-    for (const item of classified.auto) {
-      if (item.type === "rename") {
-        console.log(chalk.green(`    ${item.from} → ${item.to}`));
-      } else if (item.type === "rename-dir") {
-        console.log(chalk.green(`    [dir] ${item.from}/ → ${item.to}/`));
-      } else {
-        console.log(chalk.green(`    ✕ ${item.from}`));
-      }
-    }
-    console.log("");
-  }
-
-  if (classified.confirm.length > 0) {
-    console.log(chalk.yellow("  ⚠ Requires confirmation (modified by user):"));
-    for (const item of classified.confirm) {
-      if (item.type === "rename") {
-        console.log(chalk.yellow(`    ${item.from} → ${item.to}`));
-      } else {
-        console.log(chalk.yellow(`    ✕ ${item.from}`));
-      }
-    }
-    console.log("");
-  }
-
-  if (classified.conflict.length > 0) {
-    console.log(chalk.red("  ⊘ Conflict (both old and new exist):"));
-    for (const item of classified.conflict) {
-      if (item.type === "rename-dir") {
-        console.log(chalk.red(`    [dir] ${item.from}/ ↔ ${item.to}/`));
-      } else {
-        console.log(chalk.red(`    ${item.from} ↔ ${item.to}`));
-      }
-    }
-    console.log(
-      chalk.gray(
-        "    → Resolve manually: merge or delete one, then re-run update",
-      ),
-    );
-    console.log("");
-  }
-
-  if (classified.skip.length > 0) {
-    console.log(
-      chalk.gray("  ○ Skipping (not found, protected, or not Trellis-owned):"),
-    );
-    for (const item of classified.skip.slice(0, 3)) {
-      console.log(chalk.gray(`    ${item.from}`));
-    }
-    if (classified.skip.length > 3) {
-      console.log(chalk.gray(`    ... and ${classified.skip.length - 3} more`));
-    }
-    console.log("");
-  }
-}
-
-/**
- * Prompt user for migration action on a single item.
- *
- * Design notes:
- * - Default is `backup-rename`: safest — preserves user's content as a .backup
- *   alongside the rename, so Enter-to-continue never destroys work or leaves
- *   stale paths behind.
- * - "Skip" leaves a stale old path that won't be cleaned by later updates —
- *   warn explicitly so users understand the consequence.
- * - Show manifest description + why-flagged so users can make an informed
- *   choice without needing to dig through the diff.
- */
-async function promptMigrationAction(
-  item: MigrationItem,
-): Promise<MigrationAction> {
-  const headline =
-    item.type === "rename"
-      ? `${chalk.cyan(item.from)} → ${chalk.green(item.to)}`
-      : `${chalk.red("Delete")} ${chalk.cyan(item.from)}`;
-
-  const description =
-    item.description ?? "No description provided in manifest.";
-
-  // Actions with inline guidance so users see the trade-off per choice.
-  const renameLabel =
-    item.type === "rename"
-      ? "[r] Rename anyway — use if the file is unchanged, or any edits are fine to move as-is"
-      : "[d] Delete anyway — use if you don't need this file (already migrated to replacement)";
-  const backupLabel =
-    item.type === "rename"
-      ? "[b] Backup original, then proceed — SAFEST: writes <new-path>.backup with your current content, then renames"
-      : "[b] Backup original, then proceed — SAFEST: writes <path>.backup with your current content, then deletes";
-  const skipLabel =
-    item.type === "rename"
-      ? "[s] Skip — leaves the old path in place (you'll see it flagged on future updates until cleaned up manually)"
-      : "[s] Skip — keeps the deprecated file (you'll see it flagged on future updates until cleaned up manually)";
-
-  // Prefer the per-migration `reason` (version-specific context authored in the
-  // manifest) over a generic fallback. Hardcoding version-specific hints here
-  // rots fast — every release gets a new set of edge cases.
-  const whyFlagged = item.reason
-    ? chalk.gray(
-        item.reason
-          .split("\n")
-          .map((line) => `  ${line}`)
-          .join("\n"),
-      )
-    : chalk.gray(
-        `  Why prompted: file content doesn't match the Trellis template hash\n` +
-          `  for this path — usually local customization. If unsure, pick [b].`,
-      );
-
-  const message = [
-    headline,
-    "",
-    chalk.bold("  What:") + " " + description,
-    whyFlagged,
-    "",
-    chalk.bold("  Choose:"),
-  ].join("\n");
-
-  const { choice } = await inquirer.prompt<{ choice: MigrationAction }>([
-    {
-      type: "list",
-      name: "choice",
-      message,
-      choices: [
-        { name: backupLabel, value: "backup-rename" as MigrationAction },
-        { name: renameLabel, value: "rename" as MigrationAction },
-        { name: skipLabel, value: "skip" as MigrationAction },
-      ],
-      default: "backup-rename",
-    },
-  ]);
-
-  return choice;
-}
-
-/**
- * Sort migrations for safe execution order
- * - rename-dir with deeper paths first (to handle nested directories)
- * - rename-dir before rename/delete
- */
-/** @internal Exported for testing only */
-export function sortMigrationsForExecution(
-  migrations: MigrationItem[],
-): MigrationItem[] {
-  return [...migrations].sort((a, b) => {
-    // rename-dir should be sorted by path depth (deeper first)
-    if (a.type === "rename-dir" && b.type === "rename-dir") {
-      const aDepth = a.from.split("/").length;
-      const bDepth = b.from.split("/").length;
-      return bDepth - aDepth; // Deeper paths first
-    }
-    // rename-dir before rename/delete (directories first)
-    if (a.type === "rename-dir" && b.type !== "rename-dir") return -1;
-    if (a.type !== "rename-dir" && b.type === "rename-dir") return 1;
-    return 0;
-  });
-}
-
-/**
- * Execute classified migrations
- *
- * @param options.force - Force migrate modified files without asking
- * @param options.skipAll - Skip all modified files without asking
- * If neither is set, prompts interactively for modified files
- */
-export async function executeMigrations(
-  classified: ClassifiedMigrations,
-  cwd: string,
-  options: { force?: boolean; skipAll?: boolean },
-  templates: Map<string, string>,
-): Promise<MigrationResult> {
-  const result: MigrationResult = {
-    renamed: 0,
-    deleted: 0,
-    skipped: 0,
-    conflicts: classified.conflict.length,
-  };
-
-  // Sort migrations for safe execution order
-  const sortedAuto = sortMigrationsForExecution(classified.auto);
-
-  // 1. Execute auto migrations (unmodified files and directories)
-  for (const item of sortedAuto) {
-    if (item.type === "rename" && item.to) {
-      const oldPath = path.join(cwd, item.from);
-      const newPath = path.join(cwd, item.to);
-
-      // Ensure target directory exists
-      fs.mkdirSync(path.dirname(newPath), { recursive: true });
-      fs.renameSync(oldPath, newPath);
-
-      // Update hash tracking
-      renameHash(cwd, item.from, item.to);
-
-      // Make executable if it's a script
-      if (item.to.endsWith(".sh") || item.to.endsWith(".py")) {
-        fs.chmodSync(newPath, "755");
-      }
-
-      // Clean up empty source directory
-      cleanupEmptyDirs(cwd, path.dirname(item.from));
-
-      result.renamed++;
-    } else if (item.type === "rename-dir" && item.to) {
-      const oldPath = path.join(cwd, item.from);
-      const newPath = path.join(cwd, item.to);
-      const oldPrefix = item.from.endsWith("/") ? item.from : item.from + "/";
-      const newPrefix = item.to.endsWith("/") ? item.to : item.to + "/";
-
-      // Target already exists and already holds canonical, current-version
-      // content (e.g. Codex/Gemini already wrote the shared `.agents/skills/`
-      // root before Pi's legacy `.pi/skills/` copy gets retired). Renaming
-      // the source in would clobber good content with older/differently-
-      // flavored bytes, so just drop the now-redundant source instead (#447).
-      if (
-        fs.existsSync(newPath) &&
-        dirMatchesCurrentTemplates(cwd, item.to, templates)
-      ) {
-        removeDirectoryRecursive(oldPath);
-
-        const hashes = loadHashes(cwd);
-        const updatedHashes: TemplateHashes = {};
-        for (const [hashPath, hashValue] of Object.entries(hashes)) {
-          if (hashPath.startsWith(oldPrefix)) continue; // source retired
-          updatedHashes[hashPath] = hashValue;
-        }
-        saveHashes(cwd, updatedHashes);
-
-        result.deleted++;
-        continue;
-      }
-
-      // If target exists (safe to replace, already checked in classification)
-      // delete it first before renaming
-      if (fs.existsSync(newPath)) {
-        removeDirectoryRecursive(newPath);
-      }
-
-      // Ensure parent directory exists
-      fs.mkdirSync(path.dirname(newPath), { recursive: true });
-
-      // Rename the entire directory (includes all user files)
-      fs.renameSync(oldPath, newPath);
-
-      // Batch update hash tracking for all files in the directory
-      const hashes = loadHashes(cwd);
-
-      const updatedHashes: TemplateHashes = {};
-      for (const [hashPath, hashValue] of Object.entries(hashes)) {
-        if (hashPath.startsWith(oldPrefix)) {
-          // Rename path: old prefix -> new prefix
-          const newHashPath = newPrefix + hashPath.slice(oldPrefix.length);
-          updatedHashes[newHashPath] = hashValue;
-        } else if (hashPath.startsWith(newPrefix)) {
-          // Skip old hashes from deleted target directory
-          // (they will be replaced by renamed source files)
-          continue;
-        } else {
-          // Keep unchanged
-          updatedHashes[hashPath] = hashValue;
-        }
-      }
-      saveHashes(cwd, updatedHashes);
-
-      result.renamed++;
-    } else if (item.type === "delete") {
-      const filePath = path.join(cwd, item.from);
-      fs.unlinkSync(filePath);
-
-      // Remove from hash tracking
-      removeHash(cwd, item.from);
-
-      // Clean up empty directory
-      cleanupEmptyDirs(cwd, path.dirname(item.from));
-
-      result.deleted++;
-    }
-  }
-
-  // 2. Handle confirm items (modified files)
-  // Note: All files are already backed up by createMigrationBackup before execution
-  for (const item of classified.confirm) {
-    let action: MigrationAction;
-
-    if (options.force) {
-      // Force mode: proceed (already backed up)
-      action = "rename";
-    } else if (options.skipAll) {
-      // Skip mode: skip all modified files
-      action = "skip";
-    } else {
-      // Default: interactive prompt
-      action = await promptMigrationAction(item);
-    }
-
-    if (action === "skip") {
-      result.skipped++;
-      continue;
-    }
-
-    // For `backup-rename`, leave an inline .backup copy of the user's modified
-    // original next to the new location (for rename) or in place (for delete).
-    // This is in addition to the full project snapshot at .trellis/.backup-*/;
-    // the inline copy is more discoverable when the user wants to diff or merge
-    // their customizations against the new template.
-    if (item.type === "rename" && item.to) {
-      const oldPath = path.join(cwd, item.from);
-      const newPath = path.join(cwd, item.to);
-
-      fs.mkdirSync(path.dirname(newPath), { recursive: true });
-
-      if (action === "backup-rename") {
-        // Copy original alongside the new path before the rename overwrites nothing
-        // (target dir is guaranteed fresh since `conflict` is handled elsewhere).
-        fs.copyFileSync(oldPath, newPath + ".backup");
-      }
-
-      fs.renameSync(oldPath, newPath);
-      renameHash(cwd, item.from, item.to);
-
-      if (item.to.endsWith(".sh") || item.to.endsWith(".py")) {
-        fs.chmodSync(newPath, "755");
-      }
-
-      // Clean up empty source directory
-      cleanupEmptyDirs(cwd, path.dirname(item.from));
-
-      result.renamed++;
-    } else if (item.type === "delete") {
-      const filePath = path.join(cwd, item.from);
-
-      if (action === "backup-rename") {
-        // Keep a .backup copy in place before deletion so the user can recover
-        // inline without digging through .trellis/.backup-*/.
-        fs.copyFileSync(filePath, filePath + ".backup");
-      }
-
-      fs.unlinkSync(filePath);
-      removeHash(cwd, item.from);
-
-      // Clean up empty directory
-      cleanupEmptyDirs(cwd, path.dirname(item.from));
-
-      result.deleted++;
-    }
-  }
-
-  // 3. Skip count already tracked (old files not found)
-  result.skipped += classified.skip.length;
-
-  return result;
-}
-
-/**
- * Print migration result summary
- */
-function printMigrationResult(result: MigrationResult): void {
-  const parts: string[] = [];
-
-  if (result.renamed > 0) {
-    parts.push(`${result.renamed} renamed`);
-  }
-  if (result.deleted > 0) {
-    parts.push(`${result.deleted} deleted`);
-  }
-  if (result.skipped > 0) {
-    parts.push(`${result.skipped} skipped`);
-  }
-  if (result.conflicts > 0) {
-    parts.push(
-      `${result.conflicts} conflict${result.conflicts > 1 ? "s" : ""}`,
-    );
-  }
-
-  if (parts.length > 0) {
-    console.log(chalk.cyan(`Migration complete: ${parts.join(", ")}`));
-  }
-}
-
-/**
- * One-time 0.2.0 migration: rename `traces-*.md` → `journal-*.md` in every
- * developer workspace directory.
- *
- * Never overwrites an existing `journal-N.md`: a newer session may already
- * have created it, and `.trellis/workspace/` is excluded from the update
- * backup (see `BACKUP_EXCLUDE_PATTERNS`), so clobbering it would be
- * unrecoverable data loss. Conflicting `traces-N.md` files are left in place
- * and reported instead.
- */
-export function renameTracesToJournal(workspaceDir: string): {
-  renamed: number;
-  skipped: string[];
-} {
-  const skipped: string[] = [];
-  let renamed = 0;
-  if (!fs.existsSync(workspaceDir)) return { renamed, skipped };
-
-  for (const dev of fs.readdirSync(workspaceDir)) {
-    const devPath = path.join(workspaceDir, dev);
-    if (!fs.statSync(devPath).isDirectory()) continue;
-
-    for (const file of fs.readdirSync(devPath)) {
-      if (!(file.startsWith("traces-") && file.endsWith(".md"))) continue;
-      const oldPath = path.join(devPath, file);
-      const newPath = path.join(devPath, file.replace("traces-", "journal-"));
-      if (fs.existsSync(newPath)) {
-        skipped.push(oldPath);
-        continue;
-      }
-      fs.renameSync(oldPath, newPath);
-      renamed++;
-    }
-  }
-  return { renamed, skipped };
-}
-
-/**
  * Main update command
  */
 export async function update(options: UpdateOptions): Promise<void> {
@@ -2112,6 +1434,7 @@ export async function update(options: UpdateOptions): Promise<void> {
   // Get versions
   const projectVersion = getInstalledVersion(cwd);
   const cliVersion = VERSION;
+  requireMigrationManifest(cliVersion);
   const latestNpmVersion = await getLatestNpmVersion();
 
   // Version comparison
@@ -2168,7 +1491,14 @@ export async function update(options: UpdateOptions): Promise<void> {
   // Migration metadata is displayed at the end to prevent scrolling off screen
 
   // Load template hashes for modification detection
+  const upgrading040 = projectVersion.startsWith("0.4.") && cliVsProject > 0;
+  if (upgrading040) checkLegacyPaths(cwd, [".trellis/.template-hashes.json"]);
   let hashes = loadHashes(cwd);
+  const legacy =
+    upgrading040 && Object.keys(hashes).length === 0
+      ? readFlatReceipt040(cwd)
+      : undefined;
+  if (legacy) hashes = legacy;
   const zcodeConfigured = getConfiguredPlatforms(cwd).has("zcode");
   const isFirstHashTracking = Object.keys(hashes).length === 0;
 
@@ -2200,28 +1530,45 @@ export async function update(options: UpdateOptions): Promise<void> {
     );
   }
 
+  const applicableMigrations = isUnknownVersion
+    ? []
+    : getMigrationsForVersion("0.0.0", cliVersion);
+  const allMigrations = getAllMigrations();
+  const legacySourceFiles = legacyRenameSourceFiles(allMigrations);
+
   // Self-heal poisoned manifests: prune entries that no current platform
   // configurator owns. This silently removes user-owned paths that early
   // buggy versions of `trellis init` over-hashed (e.g. .codex/sessions/*).
   // Include codex in known-platforms when codexUpgradeNeeded so legacy Codex
   // markers under .agents/skills/ survive into the upgrade flow.
-  {
-    const configuredPlatforms = new Set<AITool>(getConfiguredPlatforms(cwd));
-    if (codexUpgradeNeeded) configuredPlatforms.add("codex");
-    const prune = pruneOrphanManifestKeys(
-      cwd,
-      [...configuredPlatforms],
-      hashes,
-    );
-    if (prune.pruned.length > 0) {
-      console.log(
-        chalk.gray(
-          `   Pruned ${prune.pruned.length} orphan manifest entries from .template-hashes.json`,
-        ),
-      );
-      hashes = prune.hashes;
+  const configuredPlatforms = new Set<AITool>(getConfiguredPlatforms(cwd));
+  if (codexUpgradeNeeded) configuredPlatforms.add("codex");
+  if (upgrading040) {
+    for (const platform of platformsFromReceipts040(hashes))
+      configuredPlatforms.add(platform);
+    for (const platform of configuredPlatforms) {
+      checkLegacyPaths(cwd, collectPlatformTemplates(platform)?.keys() ?? []);
+    }
+    checkLegacyPaths(cwd, [
+      retiredRalphHook,
+      CLAUDE_SETTINGS_PATH,
+      ".claude/settings.local.json",
+      FILE_NAMES.AGENTS,
+      ".trellis/config.yaml",
+      ".trellis/.version",
+    ]);
+    // Only traverse paths from shipped manifests, never unchecked v2 keys.
+    for (const item of allMigrations) {
+      if (!hashes[item.from]) continue;
+      const target = item.to ?? item.from;
+      checkLegacyPaths(cwd, [item.from, target, `${target}.backup`]);
     }
   }
+  const prune = pruneOrphanManifestKeys(cwd, [...configuredPlatforms], hashes, {
+    persist: false,
+    legacySourceFiles,
+  });
+  hashes = prune.hashes;
 
   // For breaking releases with recommendMigrate + --migrate, bypass update.skip
   // across the board (safe-file-delete, new file writes, template updates).
@@ -2243,16 +1590,17 @@ export async function update(options: UpdateOptions): Promise<void> {
   // Collect templates (used for both migration classification and change analysis)
   const templates = await collectTemplateFiles(
     cwd,
-    codexUpgradeNeeded ? new Set<AITool>(["codex"]) : undefined,
+    configuredPlatforms,
     breakingBypass,
   );
+
+  if (upgrading040) checkLegacyPaths(cwd, templates.keys());
 
   // Load update.skip paths (used for both safe-file-delete and template collection)
   const skipPaths = loadUpdateSkipPaths(cwd);
 
   // Collect safe-file-delete items from ALL manifests (hash match is the safety net)
   // This runs regardless of version — unknown version still gets safe cleanup
-  const allMigrations = getAllMigrations();
   const safeFileDeletes = collectSafeFileDeletes(
     allMigrations,
     cwd,
@@ -2263,6 +1611,27 @@ export async function update(options: UpdateOptions): Promise<void> {
   const hasSafeDeletes =
     safeFileDeletes.filter((c) => c.action === "delete").length > 0;
 
+  const ralphDeletion = upgrading040
+    ? safeFileDeletes.find(
+        (entry) =>
+          entry.action === "delete" && entry.item.from === retiredRalphHook,
+      )
+    : undefined;
+  if (ralphDeletion) {
+    cleanLegacyRalphSettings(cwd, ".claude/settings.local.json", false);
+    if (
+      cleanLegacyRalphSettings(
+        cwd,
+        CLAUDE_SETTINGS_PATH,
+        configuredPlatforms.has("claude-code"),
+      )
+    ) {
+      console.log(
+        `Removing the retired SubagentStop hook from ${CLAUDE_SETTINGS_PATH}.`,
+      );
+    }
+  }
+
   // Check for pending regular migrations (skip if unknown version)
   let pendingMigrations = isUnknownVersion
     ? []
@@ -2270,7 +1639,7 @@ export async function update(options: UpdateOptions): Promise<void> {
 
   // Also check for "orphaned" migrations - where source still exists but version says we shouldn't migrate
   // This handles cases where version was updated but migrations weren't applied
-  const orphanedMigrations = allMigrations.filter((item) => {
+  const orphanedMigrations = applicableMigrations.filter((item) => {
     // Only check rename and rename-dir migrations
     if (item.type !== "rename" && item.type !== "rename-dir") return false;
     if (!item.from || !item.to) return false;
@@ -2278,15 +1647,19 @@ export async function update(options: UpdateOptions): Promise<void> {
     const oldPath = path.join(cwd, item.from);
     const newPath = path.join(cwd, item.to);
 
-    // Orphaned if: source exists AND target doesn't exist
-    // AND this migration isn't already in pendingMigrations
     const sourceExists = fs.existsSync(oldPath);
     const targetExists = fs.existsSync(newPath);
     const alreadyPending = pendingMigrations.some(
       (m) => m.from === item.from && m.to === item.to,
     );
 
-    return sourceExists && !targetExists && !alreadyPending;
+    if (!sourceExists || alreadyPending) return false;
+    if (!targetExists) return true;
+    return (
+      options.migrate &&
+      item.type === "rename-dir" &&
+      dirHasManifestEntries(cwd, item.from, hashes, legacySourceFiles, true)
+    );
   });
 
   // Add orphaned migrations to pending (they need to be applied)
@@ -2386,11 +1759,39 @@ export async function update(options: UpdateOptions): Promise<void> {
   }
 
   // Analyze changes (pass hashes for modification detection)
-  const changes = analyzeChanges(cwd, hashes, templates);
-  const unchangedFileHashRepairs = collectUnchangedFileHashRepairs(
-    changes,
-    hashes,
-  );
+  let changes = analyzeChanges(cwd, hashes, templates);
+
+  if (options.migrate && classifiedMigrations) {
+    // For an absent destination, the source tree is what the write phase
+    // will see after rename. A source file may occupy a template's parent.
+    for (const item of classifiedMigrations.auto) {
+      if (
+        item.type !== "rename-dir" ||
+        !item.to ||
+        fs.existsSync(path.join(cwd, item.to))
+      )
+        continue;
+      for (const target of templates.keys()) {
+        if (!target.startsWith(`${item.to}/`)) continue;
+        const source = item.from + target.slice(item.to.length);
+        if (
+          !fs.existsSync(path.join(cwd, source)) &&
+          (hashes[source] || hashes[target])
+        )
+          continue;
+        checkTemplatePath(cwd, source, target);
+      }
+    }
+  }
+
+  if (!legacy && prune.pruned.length > 0 && !options.dryRun) {
+    saveHashes(cwd, hashes);
+    console.log(
+      chalk.gray(
+        `   Pruned ${prune.pruned.length} orphan manifest entries from .template-hashes.json`,
+      ),
+    );
+  }
 
   // Print summary
   printChangeSummary(changes);
@@ -2434,12 +1835,17 @@ export async function update(options: UpdateOptions): Promise<void> {
     changes.newFiles.length === 0 &&
     changes.autoUpdateFiles.length === 0 &&
     changes.changedFiles.length === 0 &&
+    !legacy &&
     !hasPendingMigrations &&
     !hasSafeDeletes
   ) {
     // The "already up to date" exit still has to repair the receipt: this is
     // exactly the clean tree where every file is `unchanged`, so it is the run
     // where a wrong entry would otherwise be skipped again.
+    const unchangedFileHashRepairs = collectUnchangedFileHashRepairs(
+      changes,
+      hashes,
+    );
     if (!options.dryRun && unchangedFileHashRepairs.size > 0) {
       updateHashes(cwd, unchangedFileHashRepairs);
     }
@@ -2448,7 +1854,7 @@ export async function update(options: UpdateOptions): Promise<void> {
       console.log(chalk.green("✓ Already up to date!"));
     } else {
       // Version changed but no file changes needed — still update the version stamp
-      updateVersionFile(cwd);
+      if (!options.dryRun) updateVersionFile(cwd);
       if (isUpgrade) {
         console.log(
           chalk.green(
@@ -2563,6 +1969,8 @@ export async function update(options: UpdateOptions): Promise<void> {
     );
   }
 
+  if (legacy) saveHashes(cwd, hashes);
+
   // Execute migrations if --migrate flag is set
   if (options.migrate && classifiedMigrations) {
     const migrationResult = await executeMigrations(
@@ -2575,6 +1983,10 @@ export async function update(options: UpdateOptions): Promise<void> {
       templates,
     );
     printMigrationResult(migrationResult);
+    if (migrationResult.renamed || migrationResult.deleted) {
+      hashes = loadHashes(cwd);
+      changes = analyzeChanges(cwd, hashes, templates);
+    }
 
     // Hardcoded: Rename traces-*.md to journal-*.md in workspace directories
     // Why hardcoded: The migration system only supports fixed path renames, not pattern-based.
@@ -2598,10 +2010,13 @@ export async function update(options: UpdateOptions): Promise<void> {
     }
   }
 
-  // Execute safe-file-delete (after backup, before template writes)
+  // The old Claude hook must survive until the active settings are settled.
   let safeDeleted = 0;
   if (hasSafeDeletes) {
-    safeDeleted = executeSafeFileDeletes(safeFileDeletes, cwd);
+    safeDeleted = executeSafeFileDeletes(
+      safeFileDeletes.filter((entry) => entry !== ralphDeletion),
+      cwd,
+    );
     if (safeDeleted > 0) {
       console.log(
         chalk.cyan(`\nCleaned up ${safeDeleted} deprecated command file(s)`),
@@ -2677,6 +2092,7 @@ export async function update(options: UpdateOptions): Promise<void> {
         updated++;
       } else if (action === "create-new") {
         const newPath = file.path + ".new";
+        if (upgrading040) checkLegacyPaths(cwd, [`${file.relativePath}.new`]);
         fs.writeFileSync(newPath, file.newContent);
         console.log(chalk.blue(`  ✓ Created: ${file.relativePath}.new`));
         createdNew++;
@@ -2685,6 +2101,16 @@ export async function update(options: UpdateOptions): Promise<void> {
         skipped++;
       }
     }
+  }
+
+  if (ralphDeletion) {
+    const cleaned = cleanLegacyRalphSettings(
+      cwd,
+      CLAUDE_SETTINGS_PATH,
+      configuredPlatforms.has("claude-code"),
+    );
+    if (cleaned) writeFileAtomic(path.join(cwd, CLAUDE_SETTINGS_PATH), cleaned);
+    safeDeleted += executeSafeFileDeletes([ralphDeletion], cwd);
   }
 
   // Append additive config.yaml sections introduced between versions.
@@ -2710,7 +2136,7 @@ export async function update(options: UpdateOptions): Promise<void> {
   updateVersionFile(cwd);
 
   // Update template hashes for new, auto-updated, and overwritten files
-  const filesToHash = new Map<string, string>(unchangedFileHashRepairs);
+  const filesToHash = collectUnchangedFileHashRepairs(changes, hashes);
   for (const file of changes.newFiles) {
     filesToHash.set(file.relativePath, file.newContent);
   }

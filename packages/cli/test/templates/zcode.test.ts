@@ -14,6 +14,14 @@ describe("zcode getAllAgents", () => {
     expect(names).toEqual(EXPECTED_AGENT_NAMES);
   });
 
+  it("checks the changes against the PRD and optional task design and plan", () => {
+    const check = getAllAgents().find((agent) => agent.name === "trellis-check");
+    const reviewStep = check?.content.split("### Step 2:")[1]?.split("### Step 3:")[0];
+    expect(reviewStep).toMatch(/check the changes against.*`prd\.md`/i);
+    expect(reviewStep).toContain("`design.md` if present");
+    expect(reviewStep).toContain("`implement.md` if present");
+  });
+
   it("each agent is a Markdown file with YAML frontmatter", () => {
     for (const agent of getAllAgents()) {
       const content = agent.content.replace(/\r\n/g, "\n");

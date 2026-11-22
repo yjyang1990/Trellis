@@ -9,6 +9,10 @@
  * one of the registries or derived data.
  */
 
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { AI_TOOLS } from "../src/types/ai-tools.js";
 import {
@@ -347,5 +351,70 @@ describe("every platform resolves to a marker label workflow.md uses", () => {
   });
 });
 
+describe("task.py create platform context manifests", () => {
+  const cases = PLATFORM_IDS.map((id) => ({
+    name: AI_TOOLS[id].name,
+    marker: AI_TOOLS[id].configDir,
+    mode: "",
+    // DSH has agent tools but Trellis implements its workflow inline.
+    expected: AI_TOOLS[id].templateContext.agentCapable && id !== "dsh",
+  }));
+  cases.push(
+    { name: "Codex auto", marker: ".codex", mode: "auto", expected: true },
+    {
+      name: "Codex legacy",
+      marker: ".codex",
+      mode: "sub-agent",
+      expected: true,
+    },
+    { name: "Codex inline", marker: ".codex", mode: "inline", expected: false },
+    {
+      name: "shared skills alone",
+      marker: ".agents/skills",
+      mode: "",
+      expected: false,
+    },
+    { name: "GitHub alone", marker: ".github", mode: "", expected: false },
+    { name: "legacy Kiro root", marker: ".kiro", mode: "", expected: true },
+  );
+
+  it.each(cases)("$name", ({ marker, mode, expected }) => {
+    const repo = fs.mkdtempSync(
+      path.join(os.tmpdir(), "trellis-task-context-"),
+    );
+    try {
+      fs.mkdirSync(path.join(repo, marker), { recursive: true });
+      fs.mkdirSync(path.join(repo, ".trellis"));
+      if (mode) {
+        fs.writeFileSync(
+          path.join(repo, ".trellis/config.yaml"),
+          `codex:\n  dispatch_mode: ${mode}\n`,
+        );
+      }
+      const task = execFileSync(
+        process.env.PYTHON_CMD || "python3",
+        [
+          path.resolve(__dirname, "../src/templates/trellis/scripts/task.py"),
+          "create",
+          "probe",
+          "--description",
+          "context manifests",
+          "--assignee",
+          "tester",
+          "--no-start",
+        ],
+        { cwd: repo, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+      ).trim();
+      expect(fs.existsSync(path.join(repo, task, "task.json"))).toBe(true);
+      for (const role of ["implement", "check"]) {
+        const manifest = path.join(repo, task, `${role}.jsonl`);
+        if (expected) expect(fs.readFileSync(manifest, "utf-8")).toBe("");
+        else expect(fs.existsSync(manifest)).toBe(false);
+      }
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
 // Roundtrip and derived-helper tests are in configurators/index.test.ts
 // This file focuses on internal consistency invariants only

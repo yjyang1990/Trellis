@@ -20,7 +20,8 @@ vi.mock("inquirer", () => ({
   default: { prompt: vi.fn().mockResolvedValue({}) },
 }));
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   execSync: vi.fn().mockReturnValue(""),
 }));
 
@@ -919,19 +920,12 @@ describe("init() integration", () => {
     expect(second).toEqual(first);
   });
 
-  it("#7 passes developer name to init_developer script", async () => {
-    await init({ yes: true, user: "testdev" });
+  it("#7 initializes the workspace for a developer whose name contains spaces", async () => {
+    await init({ yes: true, user: "Test Developer" });
 
-    const calls = vi.mocked(execSync).mock.calls;
-    const match = calls.find(
-      ([cmd]) => typeof cmd === "string" && cmd.includes("init_developer.py"),
-    );
-    expect(match).toBeDefined();
-    const command = String((match as [unknown])[0]);
-    const expectedPythonCmd =
-      process.platform === "win32" ? "python" : "python3";
-    expect(command).toContain(`${expectedPythonCmd} "`);
-    expect(command).toContain('"testdev"');
+    expect(fs.readFileSync(path.join(tmpDir, PATHS.DEVELOPER_FILE), "utf-8"))
+      .toContain("name=Test Developer\n");
+    expect(fs.existsSync(path.join(tmpDir, PATHS.WORKSPACE, "Test Developer", "journal-1.md"))).toBe(true);
   });
 
   it("#7b throws when the selected Python command is below 3.9", async () => {

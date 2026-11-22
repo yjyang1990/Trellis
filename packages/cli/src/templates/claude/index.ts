@@ -13,6 +13,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readAgentTemplate } from "../read-agent-template.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -48,7 +49,7 @@ export function getAllAgents(): AgentTemplate[] {
   for (const file of files) {
     if (file.endsWith(".md")) {
       const name = file.replace(".md", "");
-      const content = readTemplate(`agents/${file}`);
+      const content = readAgentTemplate(join(__dirname, "agents", file));
       agents.push({ name, content });
     }
   }

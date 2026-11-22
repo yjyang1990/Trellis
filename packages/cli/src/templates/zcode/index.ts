@@ -25,7 +25,9 @@ import {
 
 export type { AgentTemplate, HookTemplate };
 
-const { listMdAgents, getSettings } = createTemplateReader(import.meta.url);
+const { listMdAgents, getSettings, readTemplate } = createTemplateReader(
+  import.meta.url,
+);
 
 /** Sub-agent definitions (trellis-implement, trellis-check, trellis-research). */
 export function getAllAgents(): AgentTemplate[] {
@@ -35,4 +37,9 @@ export function getAllAgents(): AgentTemplate[] {
 /** Hook configuration written to `.zcode/config.json` (workspace config form). */
 export function getHooksConfig(): HookTemplate {
   return getSettings("config.json");
+}
+
+/** Published workspace config before the Bash shell-session hook was added. */
+export function getConfigBeforeShellHook(): string {
+  return readTemplate("config-before-shell-hook.json");
 }
